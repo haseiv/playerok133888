@@ -3,8 +3,11 @@ aiosqlite==0.20.0
 cryptography==43.0.3
 python-dotenv==1.0.1
 
-# Неофициальный API Playerok. В PyPI его нет, ставится из GitHub —
-# значит, в окружении сборки обязан быть git.
-# Если сборка падает с "git: command not found" — библиотеку придётся
-# положить в репозиторий папкой playerokapi/ и убрать эту строку.
-playerokapi @ git+https://github.com/alleexxeeyy/PlayerokAPI.git
+# Библиотека playerokapi НЕ ставится через pip: в PyPI её нет, а тянуть
+# из GitHub нельзя — на хостинге отсутствует git. Поэтому она лежит
+# в репозитории папкой playerokapi/ рядом с bot.py.
+# Ниже — её собственные зависимости.
+requests
+websocket-client
+beautifulsoup4
+lxml

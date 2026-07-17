@@ -1,0 +1,31 @@
+[Unit]
+Description=Playerok Steam bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/playerok_bot
+EnvironmentFile=/opt/playerok_bot/.env
+ExecStart=/opt/playerok_bot/.venv/bin/python bot.py
+
+# Перезапуск при падении, но не чаще 5 раз за минуту — иначе при
+# неверном токене получим бесконечный цикл рестартов и спам в логи
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Изоляция: боту нужен только свой каталог
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/playerok_bot/data
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

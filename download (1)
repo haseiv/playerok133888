@@ -1,0 +1,11 @@
+.env
+data/
+*.maFile
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/

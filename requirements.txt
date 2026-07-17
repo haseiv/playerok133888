@@ -1,0 +1,10 @@
+aiogram==3.15.0
+aiosqlite==0.20.0
+cryptography==43.0.3
+python-dotenv==1.0.1
+
+# Неофициальный API Playerok. Ставится из GitHub (в PyPI его нет),
+# поэтому в Docker-образе обязателен git.
+# Версию не пиним тегом: у проекта их нет. Для продакшена лучше
+# заменить на конкретный коммит: ...PlayerokAPI.git@<sha>
+playerokapi @ git+https://github.com/alleexxeeyy/PlayerokAPI.git

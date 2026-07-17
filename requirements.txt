@@ -3,11 +3,4 @@ aiosqlite==0.20.0
 cryptography==43.0.3
 python-dotenv==1.0.1
 
-# Библиотека playerokapi НЕ ставится через pip: в PyPI её нет, а тянуть
-# из GitHub нельзя — на хостинге отсутствует git. Поэтому она лежит
-# в репозитории папкой playerokapi/ рядом с bot.py.
-# Ниже — её собственные зависимости.
-requests
-websocket-client
-beautifulsoup4
-lxml
+https://github.com/alleexxeeyy/PlayerokAPI/archive/refs/heads/main.zip

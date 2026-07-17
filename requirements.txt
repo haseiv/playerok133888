@@ -3,8 +3,8 @@ aiosqlite==0.20.0
 cryptography==43.0.3
 python-dotenv==1.0.1
 
-# Неофициальный API Playerok. Ставится из GitHub (в PyPI его нет),
-# поэтому в Docker-образе обязателен git.
-# Версию не пиним тегом: у проекта их нет. Для продакшена лучше
-# заменить на конкретный коммит: ...PlayerokAPI.git@<sha>
+# Неофициальный API Playerok. В PyPI его нет, ставится из GitHub —
+# значит, в окружении сборки обязан быть git.
+# Если сборка падает с "git: command not found" — библиотеку придётся
+# положить в репозиторий папкой playerokapi/ и убрать эту строку.
 playerokapi @ git+https://github.com/alleexxeeyy/PlayerokAPI.git

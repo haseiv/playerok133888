@@ -18,12 +18,60 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 log = logging.getLogger(__name__)
+
+CACERT_URL = (
+    "https://raw.githubusercontent.com/alleexxeeyy/PlayerokAPI/main/"
+    "playerokapi/cacert.pem"
+)
+
+
+def ensure_cacert() -> None:
+    """Кладёт cacert.pem рядом с установленной библиотекой.
+
+    setup.py у playerokapi не включает cacert.pem в пакет, поэтому после
+    `pip install` файла нет и Account() падает с FileNotFoundError.
+    Чиним на старте: качаем файл в каталог библиотеки, если его там нет.
+    Альтернатива — руками копировать файл в контейнер после каждого
+    передеплоя, что на эфемерном диске придётся делать постоянно.
+    """
+    import playerokapi
+
+    dest = os.path.join(os.path.dirname(playerokapi.__file__), "cacert.pem")
+    if os.path.exists(dest) and os.path.getsize(dest) > 1000:
+        return
+
+    # Сначала пробуем взять сертификаты из certifi: он и так есть в
+    # зависимостях, а тянуть файл из сети — лишняя точка отказа.
+    try:
+        import certifi
+
+        shutil.copyfile(certifi.where(), dest)
+        log.info("cacert.pem взят из certifi -> %s", dest)
+        return
+    except Exception:
+        log.info("certifi недоступен, качаю cacert.pem из репозитория")
+
+    try:
+        with urllib.request.urlopen(CACERT_URL, timeout=30) as r:
+            data = r.read()
+        if len(data) < 1000:
+            raise RuntimeError("подозрительно маленький cacert.pem")
+        with open(dest, "wb") as f:
+            f.write(data)
+        log.info("cacert.pem загружен -> %s", dest)
+    except Exception:
+        log.exception(
+            "Не удалось подготовить cacert.pem. Подключение к Playerok упадёт."
+        )
 
 
 @dataclass
@@ -64,6 +112,7 @@ class PlayerokMarket:
 
     def connect(self):
         """Логинится по cookies. Бросает исключение, если сессия мертва."""
+        ensure_cacert()
         from playerokapi.account import Account
 
         kwargs = {

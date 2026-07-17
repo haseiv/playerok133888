@@ -2,6 +2,11 @@ aiogram==3.15.0
 aiosqlite==0.20.0
 cryptography==43.0.3
 python-dotenv==1.0.1
-tqdm
 
+# Зависимости playerokapi, которые её setup.py не дотягивает
+tqdm
+certifi
+
+# playerokapi ставится из zip-архива GitHub, а НЕ через git+https:
+# на хостинге нет git, и вариант с git+ падает с "Cannot find command 'git'".
 https://github.com/alleexxeeyy/PlayerokAPI/archive/refs/heads/main.zip

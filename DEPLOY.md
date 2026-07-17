@@ -23,8 +23,7 @@
 # на сервере
 git clone <ваш_репозиторий> /opt/playerok_bot && cd /opt/playerok_bot
 cp .env.example .env
-docker compose run --rm bot python crypto.py   # получить FERNET_KEY
-nano .env                                      # вписать все значения
+nano .env                                      # вписать значения
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -43,7 +42,6 @@ mkdir -p /opt/playerok_bot && cd /opt/playerok_bot
 # скопировать сюда файлы проекта
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python crypto.py        # FERNET_KEY
 cp .env.example .env && nano .env
 mkdir -p data && chown -R botuser:botuser /opt/playerok_bot
 chmod 600 .env
@@ -64,8 +62,10 @@ journalctl -u playerok-bot -f
    0 */6 * * * /opt/playerok_bot/backup.sh >> /var/log/bot-backup.log 2>&1
    ```
    Проверьте, что бэкап **восстанавливается**, а не просто создаётся.
-3. **FERNET_KEY — в менеджер паролей.** Потеряете ключ — потеряете весь склад
-   аккаунтов, расшифровать будет нечем. Держите копию отдельно от сервера.
+3. **Скопируйте ключ шифрования в менеджер паролей.** Он в `data/.fernet_key`
+   (создаётся при первом запуске) или в переменной `FERNET_KEY`. Потеряете —
+   потеряете весь склад: расшифровать будет нечем. Копию держите отдельно
+   от сервера.
 4. **Один экземпляр бота.** Two polling-процесса с одним токеном будут драться
    за апдейты и выдавать заказы дважды. Не запускайте Docker и systemd
    одновременно, не оставляйте бота на локальной машине после деплоя.

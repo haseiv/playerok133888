@@ -15,7 +15,7 @@ class Config:
     bot_token: str = os.getenv("BOT_TOKEN", "")
     admin_ids: list[int] = field(default_factory=lambda: _ids(os.getenv("ADMIN_IDS", "")))
     db_path: str = os.getenv("DB_PATH", "data/store.db")
-    # Ключ шифрования maFile в БД. Сгенерировать: python -m crypto_keygen
+    # Ключ шифрования. Пусто — бот создаст файл data/.fernet_key сам.
     fernet_key: str = os.getenv("FERNET_KEY", "")
     # Playerok: авторизация по cookies живой сессии, а не по токену API.
     # Формат: __ddg3=ЗНАЧЕНИЕ;token=ЗНАЧЕНИЕ
@@ -34,8 +34,6 @@ class Config:
     def validate(self) -> None:
         if not self.bot_token:
             raise RuntimeError("BOT_TOKEN не задан в .env")
-        if not self.fernet_key:
-            raise RuntimeError("FERNET_KEY не задан в .env (см. README)")
         if not self.admin_ids:
             raise RuntimeError("ADMIN_IDS не задан в .env")
         # Cookies без User-Agent = мгновенный разлогин и антибот.

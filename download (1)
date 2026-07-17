@@ -1,4 +1,5 @@
 .env
+.fernet_key
 data/
 *.maFile
 *.db

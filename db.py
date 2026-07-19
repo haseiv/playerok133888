@@ -208,6 +208,20 @@ class Storage:
         row = await cur.fetchone()
         return _account(row) if row else None
 
+    async def all_accounts(self, product: str | None = None) -> list[Account]:
+        """Все аккаунты, опционально по товару. Для списка в панели."""
+        if product:
+            cur = await self.db.execute(
+                "SELECT * FROM accounts WHERE product=? ORDER BY id", (product,)
+            )
+        else:
+            cur = await self.db.execute("SELECT * FROM accounts ORDER BY product, id")
+        return [_account(r) for r in await cur.fetchall()]
+
+    async def count_accounts(self) -> int:
+        cur = await self.db.execute("SELECT COUNT(*) c FROM accounts")
+        return (await cur.fetchone())["c"]
+
     async def set_status(self, account_id: int, status: str) -> bool:
         cur = await self.db.execute(
             "UPDATE accounts SET status=? WHERE id=?", (status, account_id)

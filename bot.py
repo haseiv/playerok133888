@@ -124,30 +124,69 @@ async def got_product(msg: Message, state: FSMContext):
 
 # ─────────────────────────── админ-команды ───────────────────────────
 
-@dp.message(Command("stock"))
-async def cmd_stock(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
+async def _stock_text() -> str:
     rows = await storage.stock()
     if not rows:
-        await msg.answer("Склад пуст. Добавьте аккаунт: /add")
-        return
+        return "📊 Склад пуст. Добавьте аккаунт: /add"
     labels = {"free": "свободно", "rented": "занято полностью",
               "sold": "продано", "maintenance": "на проверке"}
     by_product: dict[str, list[str]] = {}
     for product, status, count in rows:
-        by_product.setdefault(product, []).append(
-            f"{labels.get(status, status)}: {count}"
-        )
+        by_product.setdefault(product, []).append(f"{labels.get(status, status)}: {count}")
     settings = {p: (h, sl) for p, h, sl in await storage.products()}
     lines = []
     for product, parts in by_product.items():
         h, sl = settings.get(product, (0, 1))
         mode = f"аренда {h} ч" + (f" ×{sl}" if sl > 1 else "") if h else "продажа"
         lines.append(f"• <b>{html.escape(product)}</b> ({mode})\n  " + ", ".join(parts))
-    await msg.answer(
-        "<b>Склад:</b>\n" + "\n".join(lines) + "\n\nАктивные аренды: /rents"
-    )
+    return "<b>📊 Склад:</b>\n" + "\n".join(lines)
+
+
+async def _rents_text() -> str:
+    rows = await storage.active_rents()
+    if not rows:
+        return "🕒 Активных аренд нет."
+    lines = []
+    for acc, deal in rows:
+        busy = await storage.active_slots(acc.id)
+        _, slots = await storage.product_settings(acc.product)
+        slot_info = f" [{busy}/{slots}]" if slots > 1 else ""
+        lines.append(
+            f"• #{acc.id} <code>{html.escape(acc.login)}</code>{slot_info} "
+            f"({html.escape(acc.product)}) — осталось {human_left(deal.seconds_left())}"
+        )
+    return "<b>🕒 В аренде сейчас:</b>\n" + "\n".join(lines)
+
+
+async def _products_text() -> str:
+    rows = await storage.products()
+    if not rows:
+        return ("🏷 Настроек нет — все товары продаются навсегда.\n"
+                "Включить аренду: <code>/rent cs2-prime 24 3</code>")
+    lines = []
+    for p, h, slots in rows:
+        if h:
+            mode = f"аренда {h} ч" + (f", {slots} одновременно" if slots > 1 else "")
+        else:
+            mode = "продажа навсегда"
+        lines.append(f"• <b>{html.escape(p)}</b> — {mode}")
+    return "<b>🏷 Товары:</b>\n" + "\n".join(lines)
+
+
+async def _links_text() -> str:
+    rows = await storage.links()
+    if not rows:
+        return ("🔗 Связок нет. Бот сопоставляет лот со складом по названию.\n"
+                "Связать явно: <code>/link ID_ЛОТА = товар</code>")
+    lines = [f"• <code>{html.escape(k)}</code> → <b>{html.escape(p)}</b>" for k, p in rows]
+    return "<b>🔗 Связки лотов:</b>\n" + "\n".join(lines)
+
+
+@dp.message(Command("stock"))
+async def cmd_stock(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.answer(await _stock_text(), reply_markup=_back_kb())
 
 
 @dp.message(Command("rent"))
@@ -204,46 +243,13 @@ async def cmd_rent(msg: Message, command: CommandObject):
 async def cmd_products(msg: Message):
     if not is_admin(msg.from_user.id):
         return
-    rows = await storage.products()
-    if not rows:
-        await msg.answer(
-            "Настроек нет — все товары продаются навсегда.\n"
-            "Включить аренду: <code>/rent cs2-prime 24 3</code>"
-        )
-        return
-    lines = []
-    for p, h, slots in rows:
-        if h:
-            mode = f"аренда {h} ч"
-            if slots > 1:
-                mode += f", {slots} одновременно"
-        else:
-            mode = "продажа навсегда"
-        lines.append(f"• <b>{html.escape(p)}</b> — {mode}")
-    await msg.answer("<b>Товары:</b>\n" + "\n".join(lines))
-
+    await msg.answer(await _products_text(), reply_markup=_back_kb())
 
 @dp.message(Command("rents"))
 async def cmd_rents(msg: Message):
-    """Активные аренды."""
     if not is_admin(msg.from_user.id):
         return
-    rows = await storage.active_rents()
-    if not rows:
-        await msg.answer("Активных аренд нет.")
-        return
-    lines = []
-    for acc, deal in rows:
-        busy = await storage.active_slots(acc.id)
-        _, slots = await storage.product_settings(acc.product)
-        slot_info = f" [{busy}/{slots}]" if slots > 1 else ""
-        lines.append(
-            f"• #{acc.id} <code>{html.escape(acc.login)}</code>"
-            f"{slot_info} ({html.escape(acc.product)}) — "
-            f"осталось {human_left(deal.seconds_left())}"
-        )
-    await msg.answer("<b>В аренде сейчас:</b>\n" + "\n".join(lines))
-
+    await msg.answer(await _rents_text(), reply_markup=_back_kb())
 
 @dp.message(Command("free"))
 async def cmd_free(msg: Message, command: CommandObject):
@@ -322,18 +328,7 @@ async def cmd_link(msg: Message, command: CommandObject):
 async def cmd_links(msg: Message):
     if not is_admin(msg.from_user.id):
         return
-    rows = await storage.links()
-    if not rows:
-        await msg.answer(
-            "Связок нет. Пока их нет, бот пытается сопоставить лот со складом "
-            "по совпадению названия."
-        )
-        return
-    text = "\n".join(
-        f"• <code>{html.escape(k)}</code> → <b>{html.escape(p)}</b>" for k, p in rows
-    )
-    await msg.answer(f"<b>Связки лотов:</b>\n{text}")
-
+    await msg.answer(await _links_text(), reply_markup=_back_kb())
 
 @dp.message(Command("unlink"))
 async def cmd_unlink(msg: Message, command: CommandObject):
@@ -411,30 +406,214 @@ async def start_with_token(msg: Message, command: CommandObject):
     await msg.answer(_tg_text(acc, deal, mafile), reply_markup=_code_kb(token))
 
 
+STATUS_EMOJI = {"free": "🟢", "rented": "🔴", "sold": "⚫",
+                "maintenance": "🔧"}
+STATUS_LABEL = {"free": "свободен", "rented": "в аренде", "sold": "продан",
+                "maintenance": "на проверке"}
+PAGE_SIZE = 8
+
+
+def _panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Все аккаунты", callback_data="acc:all:0"),
+         InlineKeyboardButton(text="📊 Склад", callback_data="panel:stock")],
+        [InlineKeyboardButton(text="🕒 Аренды", callback_data="panel:rents"),
+         InlineKeyboardButton(text="🏷 Товары", callback_data="panel:products")],
+        [InlineKeyboardButton(text="🔗 Связки лотов", callback_data="panel:links")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="panel:menu")],
+    ])
+
+
+def _panel_text() -> str:
+    return (
+        "<b>🛍 Панель продавца</b>\n\n"
+        "Управляйте складом кнопками ниже.\n"
+        "Команды тоже работают: /add, /rent, /link, /issue.\n\n"
+        "Добавить аккаунт — /add"
+    )
+
+
 @dp.message(CommandStart())
 async def start(msg: Message):
     if is_admin(msg.from_user.id):
-        await msg.answer(
-            "<b>Панель продавца</b>\n\n"
-            "<b>Склад</b>\n"
-            "/add — добавить аккаунт (maFile + логин/пароль)\n"
-            "/stock — что есть и в каком статусе\n\n"
-            "<b>Аренда</b>\n"
-            "/rent &lt;товар&gt; &lt;часов&gt; — сдавать на срок (0 = продажа)\n"
-            "/products — настройки товаров\n"
-            "/rents — кто арендует сейчас\n"
-            "/endrent &lt;id&gt; — прекратить аренду досрочно\n"
-            "/free &lt;id&gt; — вернуть в оборот после проверки\n\n"
-            "<b>Площадка</b>\n"
-            "/link ID = товар — связать лот Playerok со складом\n"
-            "/links, /unlink — посмотреть и удалить связки\n"
-            "/issue &lt;товар&gt; — выдать вручную\n"
-        )
+        await msg.answer(_panel_text(), reply_markup=_panel_kb())
         return
     await msg.answer(
         "Привет! Отправьте код выдачи, который вы получили после покупки, "
         "и я пришлю данные аккаунта и код Steam Guard."
     )
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(msg: Message):
+    if is_admin(msg.from_user.id):
+        await msg.answer(_panel_text(), reply_markup=_panel_kb())
+
+
+def _accounts_kb(accounts: list[Account], page: int, total: int) -> InlineKeyboardMarkup:
+    """Клавиатура списка аккаунтов: по кнопке на аккаунт + пагинация + назад."""
+    rows = []
+    for acc in accounts:
+        emoji = STATUS_EMOJI.get(acc.status, "•")
+        rows.append([InlineKeyboardButton(
+            text=f"{emoji} #{acc.id} {acc.login} ({acc.product})",
+            callback_data=f"acc:one:{acc.id}",
+        )])
+
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"acc:all:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="acc:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"acc:all:{page+1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="panel:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("acc:all:"))
+async def cb_accounts_all(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    page = int(cb.data.split(":")[2])
+    all_acc = await storage.all_accounts()
+    total = len(all_acc)
+    if total == 0:
+        await cb.message.edit_text(
+            "📦 Склад пуст. Добавьте аккаунт: /add", reply_markup=_panel_kb()
+        )
+        await cb.answer()
+        return
+    chunk = all_acc[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    text = (
+        f"<b>📦 Все аккаунты — {total} шт.</b>\n"
+        "🟢 свободен · 🔴 в аренде · 🔧 на проверке · ⚫ продан\n\n"
+        "Нажмите на аккаунт, чтобы посмотреть детали."
+    )
+    await cb.message.edit_text(text, reply_markup=_accounts_kb(chunk, page, total))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("acc:one:"))
+async def cb_account_one(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc_id = int(cb.data.split(":")[2])
+    acc = await storage.account_by_id(acc_id)
+    if acc is None:
+        await cb.answer("Аккаунт не найден.", show_alert=True)
+        return
+
+    hours, slots = await storage.product_settings(acc.product)
+    busy = await storage.active_slots(acc.id)
+    lines = [
+        f"<b>Аккаунт #{acc.id}</b>",
+        f"Статус: {STATUS_EMOJI.get(acc.status,'•')} {STATUS_LABEL.get(acc.status, acc.status)}",
+        f"Товар: <code>{html.escape(acc.product)}</code>",
+        f"Логин: <code>{html.escape(acc.login)}</code>",
+        f"Сдавался раз: {acc.rents_count}",
+    ]
+    if slots > 1:
+        lines.append(f"Слоты: занято {busy} из {slots}")
+
+    kb = [[InlineKeyboardButton(text="🔑 Показать пароль",
+                                callback_data=f"acc:pw:{acc.id}")]]
+    if acc.status == "maintenance":
+        kb.append([InlineKeyboardButton(text="✅ Вернуть в оборот",
+                                        callback_data=f"acc:free:{acc.id}")])
+    if acc.status == "rented":
+        kb.append([InlineKeyboardButton(text="⛔️ Прекратить аренду",
+                                        callback_data=f"acc:endrent:{acc.id}")])
+    kb.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="acc:all:0")])
+
+    await cb.message.edit_text("\n".join(lines),
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("acc:pw:"))
+async def cb_account_pw(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc = await storage.account_by_id(int(cb.data.split(":")[2]))
+    if acc is None:
+        await cb.answer("Не найден.", show_alert=True)
+        return
+    # Пароль в отдельном всплывающем окне, чтобы не оставлять его в истории чата
+    await cb.answer(f"{acc.login}\n{acc.password}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("acc:free:"))
+async def cb_account_free(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc = await storage.account_by_id(int(cb.data.split(":")[2]))
+    if acc is None or acc.status == "rented":
+        await cb.answer("Сейчас нельзя.", show_alert=True)
+        return
+    await storage.set_status(acc.id, "free")
+    await cb.answer("Аккаунт снова в обороте ✅", show_alert=True)
+    cb.data = f"acc:one:{acc.id}"
+    await cb_account_one(cb)
+
+
+@dp.callback_query(F.data.startswith("acc:endrent:"))
+async def cb_account_endrent(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc_id = int(cb.data.split(":")[2])
+    for acc, deal in await storage.active_rents():
+        if acc.id == acc_id:
+            back = "maintenance" if cfg.rental_maintenance else "free"
+            await storage.finish_deal(deal.order_id, back)
+            if deal.chat_id and market:
+                await market.send_message(
+                    deal.chat_id, "⏳ Аренда прекращена. Коды больше не выдаются."
+                )
+            await cb.answer("Аренда прекращена ⛔️", show_alert=True)
+            cb.data = f"acc:one:{acc_id}"
+            await cb_account_one(cb)
+            return
+    await cb.answer("Активной аренды нет.", show_alert=True)
+
+
+@dp.callback_query(F.data == "acc:noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("panel:"))
+async def cb_panel(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    action = cb.data.split(":", 1)[1]
+
+    if action == "menu":
+        await cb.message.edit_text(_panel_text(), reply_markup=_panel_kb())
+    elif action == "stock":
+        await cb.message.edit_text(await _stock_text(), reply_markup=_back_kb())
+    elif action == "rents":
+        await cb.message.edit_text(await _rents_text(), reply_markup=_back_kb())
+    elif action == "products":
+        await cb.message.edit_text(await _products_text(), reply_markup=_back_kb())
+    elif action == "links":
+        await cb.message.edit_text(await _links_text(), reply_markup=_back_kb())
+    await cb.answer()
+
+
+def _back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="panel:menu")]
+    ])
 
 
 @dp.message(F.text.regexp(r"^[A-Za-z0-9_\-]{8,32}$"))

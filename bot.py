@@ -577,8 +577,15 @@ async def cb_accounts_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    await _render_accounts_list(cb, int(cb.data.split(":")[2]))
+    await _render_accounts_list(cb, _cb_id(cb.data))
     await cb.answer()
+
+
+def _cb_id(data: str) -> int:
+    """ID из callback_data — всегда последний сегмент после ':'.
+    Работает и для 'acc:one:5', и для 'accdel:5' независимо от числа двоеточий.
+    """
+    return int(data.rsplit(":", 1)[1])
 
 
 async def _render_account_card(cb: CallbackQuery, acc_id: int) -> None:
@@ -643,7 +650,7 @@ async def cb_account_one(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    await _render_account_card(cb, int(cb.data.split(":")[2]))
+    await _render_account_card(cb, _cb_id(cb.data))
     await cb.answer()
 
 
@@ -652,7 +659,7 @@ async def cb_account_del(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc_id = int(cb.data.split(":")[1])
+    acc_id = _cb_id(cb.data)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"accdelok:{acc_id}"),
         InlineKeyboardButton(text="Отмена", callback_data=f"acc:one:{acc_id}"),
@@ -668,7 +675,7 @@ async def cb_account_delyes(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc_id = int(cb.data.split(":")[1])
+    acc_id = _cb_id(cb.data)
     status = await storage.delete_account(acc_id)
     if status == "busy":
         await cb.answer("Аккаунт в аренде — нельзя.", show_alert=True)
@@ -683,7 +690,7 @@ async def cb_account_pw(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc = await storage.account_by_id(int(cb.data.split(":")[2]))
+    acc = await storage.account_by_id(_cb_id(cb.data))
     if acc is None:
         await cb.answer("Не найден.", show_alert=True)
         return
@@ -696,7 +703,7 @@ async def cb_account_note(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc_id = int(cb.data.split(":")[2])
+    acc_id = _cb_id(cb.data)
     await state.set_state(EditNote.waiting_text)
     await state.update_data(acc_id=acc_id)
     await cb.message.answer(
@@ -711,7 +718,7 @@ async def cb_account_free(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc = await storage.account_by_id(int(cb.data.split(":")[2]))
+    acc = await storage.account_by_id(_cb_id(cb.data))
     if acc is None or acc.status == "rented":
         await cb.answer("Сейчас нельзя.", show_alert=True)
         return
@@ -725,7 +732,7 @@ async def cb_account_endrent(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc_id = int(cb.data.split(":")[2])
+    acc_id = _cb_id(cb.data)
     for acc, deal in await storage.active_rents():
         if acc.id == acc_id:
             back = "maintenance" if cfg.rental_maintenance else "free"

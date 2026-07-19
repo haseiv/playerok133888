@@ -100,6 +100,29 @@ def ensure_playerokapi() -> None:
         )
 
 
+@dataclass
+class Order:
+    """Нормализованный заказ, независимый от библиотеки."""
+    id: str            # ID сделки
+    item_id: str       # ID лота
+    item_name: str     # Название лота
+    chat_id: str | None
+    buyer: str | None
+
+
+@dataclass
+class IncomingMessage:
+    """Сообщение от покупателя в чате сделки."""
+    chat_id: str
+    text: str
+    user_id: str
+    username: str | None
+
+
+OrderHandler = Callable[[Order], Awaitable[None]]
+MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
+
+
 class PlayerokMarket:
     def __init__(self, cookies: str, user_agent: str, proxy: str = "",
                  requests_timeout: int = 30):

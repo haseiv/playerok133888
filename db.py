@@ -90,6 +90,7 @@ class Account:
     account_name: str | None
     status: str
     rents_count: int
+    note: str | None = None
 
 
 @dataclass
@@ -127,6 +128,7 @@ def _account(row: aiosqlite.Row) -> Account:
         account_name=row["account_name"],
         status=row["status"],
         rents_count=row["rents_count"],
+        note=row["note"],
     )
 
 
@@ -273,6 +275,13 @@ class Storage:
     async def set_status(self, account_id: int, status: str) -> bool:
         cur = await self.db.execute(
             "UPDATE accounts SET status=? WHERE id=?", (status, account_id)
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def set_note(self, account_id: int, note: str | None) -> bool:
+        cur = await self.db.execute(
+            "UPDATE accounts SET note=? WHERE id=?", (note, account_id)
         )
         await self.db.commit()
         return cur.rowcount > 0

@@ -49,6 +49,10 @@ class AddAccount(StatesGroup):
     waiting_product = State()
 
 
+class EditNote(StatesGroup):
+    waiting_text = State()
+
+
 @dp.message(Command("add"))
 async def cmd_add(msg: Message, state: FSMContext):
     if not is_admin(msg.from_user.id):
@@ -120,6 +124,25 @@ async def got_product(msg: Message, state: FSMContext):
         await msg.bot.delete_message(msg.chat.id, msg.message_id - 2)
     except Exception:
         pass
+
+
+@dp.message(EditNote.waiting_text, F.text)
+async def got_note(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    acc_id = data.get("acc_id")
+    await state.clear()
+    if acc_id is None:
+        return
+    text = msg.text.strip()
+    note = None if text == "-" else text[:300]
+    ok = await storage.set_note(acc_id, note)
+    if not ok:
+        await msg.answer("Аккаунт не найден.")
+        return
+    if note:
+        await msg.answer(f"📝 Заметка для #{acc_id} сохранена.")
+    else:
+        await msg.answer(f"📝 Заметка для #{acc_id} очищена.")
 
 
 # ─────────────────────────── админ-команды ───────────────────────────
@@ -554,34 +577,16 @@ async def cb_accounts_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    page = int(cb.data.split(":")[2])
-    all_acc = await storage.all_accounts()
-    total = len(all_acc)
-    if total == 0:
-        await cb.message.edit_text(
-            "📦 Склад пуст. Добавьте аккаунт: /add", reply_markup=_panel_kb()
-        )
-        await cb.answer()
-        return
-    chunk = all_acc[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-    text = (
-        f"<b>📦 Все аккаунты — {total} шт.</b>\n"
-        "🟢 свободен · 🔴 в аренде · 🔧 на проверке · ⚫ продан\n\n"
-        "Нажмите на аккаунт, чтобы посмотреть детали."
-    )
-    await cb.message.edit_text(text, reply_markup=_accounts_kb(chunk, page, total))
+    await _render_accounts_list(cb, int(cb.data.split(":")[2]))
     await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("acc:one:"))
-async def cb_account_one(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа.", show_alert=True)
-        return
-    acc_id = int(cb.data.split(":")[2])
+async def _render_account_card(cb: CallbackQuery, acc_id: int) -> None:
+    """Рисует карточку аккаунта. Общая точка для всех кнопок карточки —
+    так не нужно мутировать cb.data (в aiogram 3 это поле read-only)."""
     acc = await storage.account_by_id(acc_id)
     if acc is None:
-        await cb.answer("Аккаунт не найден.", show_alert=True)
+        await cb.message.edit_text("Аккаунт не найден.", reply_markup=_panel_kb())
         return
 
     hours, slots = await storage.product_settings(acc.product)
@@ -595,9 +600,12 @@ async def cb_account_one(cb: CallbackQuery):
     ]
     if slots > 1:
         lines.append(f"Слоты: занято {busy} из {slots}")
+    if acc.note:
+        lines.append(f"\n📝 <i>{html.escape(acc.note)}</i>")
 
     kb = [[InlineKeyboardButton(text="🔑 Показать пароль",
                                 callback_data=f"acc:pw:{acc.id}")]]
+    kb.append([InlineKeyboardButton(text="📝 Заметка", callback_data=f"acc:note:{acc.id}")])
     if acc.status == "maintenance":
         kb.append([InlineKeyboardButton(text="✅ Вернуть в оборот",
                                         callback_data=f"acc:free:{acc.id}")])
@@ -605,13 +613,37 @@ async def cb_account_one(cb: CallbackQuery):
         kb.append([InlineKeyboardButton(text="⛔️ Прекратить аренду",
                                         callback_data=f"acc:endrent:{acc.id}")])
     else:
-        # Удалять можно всё, кроме аккаунта в активной аренде
         kb.append([InlineKeyboardButton(text="🗑 Удалить аккаунт",
                                         callback_data=f"accdel:{acc.id}")])
     kb.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="acc:all:0")])
 
     await cb.message.edit_text("\n".join(lines),
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+async def _render_accounts_list(cb: CallbackQuery, page: int) -> None:
+    all_acc = await storage.all_accounts()
+    total = len(all_acc)
+    if total == 0:
+        await cb.message.edit_text(
+            "📦 Склад пуст. Добавьте аккаунт: /add", reply_markup=_panel_kb()
+        )
+        return
+    chunk = all_acc[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    text = (
+        f"<b>📦 Все аккаунты — {total} шт.</b>\n"
+        "🟢 свободен · 🔴 в аренде · 🔧 на проверке · ⚫ продан\n\n"
+        "Нажмите на аккаунт, чтобы посмотреть детали."
+    )
+    await cb.message.edit_text(text, reply_markup=_accounts_kb(chunk, page, total))
+
+
+@dp.callback_query(F.data.startswith("acc:one:"))
+async def cb_account_one(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    await _render_account_card(cb, int(cb.data.split(":")[2]))
     await cb.answer()
 
 
@@ -620,7 +652,7 @@ async def cb_account_del(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc_id = int(cb.data.split(":")[2])
+    acc_id = int(cb.data.split(":")[1])
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"accdelok:{acc_id}"),
         InlineKeyboardButton(text="Отмена", callback_data=f"acc:one:{acc_id}"),
@@ -636,16 +668,14 @@ async def cb_account_delyes(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа.", show_alert=True)
         return
-    acc_id = int(cb.data.split(":")[2])
+    acc_id = int(cb.data.split(":")[1])
     status = await storage.delete_account(acc_id)
     if status == "busy":
         await cb.answer("Аккаунт в аренде — нельзя.", show_alert=True)
-        cb.data = f"acc:one:{acc_id}"
-        await cb_account_one(cb)
+        await _render_account_card(cb, acc_id)
         return
     await cb.answer("Удалён 🗑", show_alert=True)
-    cb.data = "acc:all:0"
-    await cb_accounts_all(cb)
+    await _render_accounts_list(cb, 0)
 
 
 @dp.callback_query(F.data.startswith("acc:pw:"))
@@ -661,6 +691,21 @@ async def cb_account_pw(cb: CallbackQuery):
     await cb.answer(f"{acc.login}\n{acc.password}", show_alert=True)
 
 
+@dp.callback_query(F.data.startswith("acc:note:"))
+async def cb_account_note(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc_id = int(cb.data.split(":")[2])
+    await state.set_state(EditNote.waiting_text)
+    await state.update_data(acc_id=acc_id)
+    await cb.message.answer(
+        f"Отправьте текст заметки для аккаунта #{acc_id}.\n"
+        f"Чтобы очистить — отправьте <code>-</code>. Отмена — /cancel"
+    )
+    await cb.answer()
+
+
 @dp.callback_query(F.data.startswith("acc:free:"))
 async def cb_account_free(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -672,8 +717,7 @@ async def cb_account_free(cb: CallbackQuery):
         return
     await storage.set_status(acc.id, "free")
     await cb.answer("Аккаунт снова в обороте ✅", show_alert=True)
-    cb.data = f"acc:one:{acc.id}"
-    await cb_account_one(cb)
+    await _render_account_card(cb, acc.id)
 
 
 @dp.callback_query(F.data.startswith("acc:endrent:"))
@@ -691,8 +735,7 @@ async def cb_account_endrent(cb: CallbackQuery):
                     deal.chat_id, "⏳ Аренда прекращена. Коды больше не выдаются."
                 )
             await cb.answer("Аренда прекращена ⛔️", show_alert=True)
-            cb.data = f"acc:one:{acc_id}"
-            await cb_account_one(cb)
+            await _render_account_card(cb, acc_id)
             return
     await cb.answer("Активной аренды нет.", show_alert=True)
 

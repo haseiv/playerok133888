@@ -28,73 +28,76 @@ from typing import Awaitable, Callable
 
 log = logging.getLogger(__name__)
 
-CACERT_URL = (
-    "https://raw.githubusercontent.com/alleexxeeyy/PlayerokAPI/main/"
-    "playerokapi/cacert.pem"
+
+ARCHIVE_URL = (
+    "https://github.com/alleexxeeyy/PlayerokAPI/archive/refs/heads/main.zip"
 )
 
 
-def ensure_cacert() -> None:
-    """Кладёт cacert.pem рядом с установленной библиотекой.
+def ensure_playerokapi() -> None:
+    """Докладывает недостающие части playerokapi после pip-установки.
 
-    setup.py у playerokapi не включает cacert.pem в пакет, поэтому после
-    `pip install` файла нет и Account() падает с FileNotFoundError.
-    Чиним на старте: качаем файл в каталог библиотеки, если его там нет.
-    Альтернатива — руками копировать файл в контейнер после каждого
-    передеплоя, что на эфемерном диске придётся делать постоянно.
+    setup.py у библиотеки не объявляет вложенные пакеты (listener, ...) и
+    не кладёт cacert.pem, поэтому `pip install` ставит только верхний
+    уровень. Итог — ModuleNotFoundError на playerokapi.listener и
+    FileNotFoundError на cacert.pem.
+
+    Чиним на старте: скачиваем тот же архив, что ставил pip, и копируем
+    из него в каталог библиотеки всё, чего не хватает. Это надёжнее, чем
+    перечислять подпапки руками: подхватится любая вложенность.
     """
+    import io
+    import zipfile
+
     import playerokapi
 
-    dest = os.path.join(os.path.dirname(playerokapi.__file__), "cacert.pem")
-    if os.path.exists(dest) and os.path.getsize(dest) > 1000:
+    pkg_dir = os.path.dirname(playerokapi.__file__)
+
+    listener_ok = os.path.isdir(os.path.join(pkg_dir, "listener"))
+    cacert_ok = os.path.exists(os.path.join(pkg_dir, "cacert.pem"))
+    if listener_ok and cacert_ok:
         return
 
-    # Сначала пробуем взять сертификаты из certifi: он и так есть в
-    # зависимостях, а тянуть файл из сети — лишняя точка отказа.
+    log.info("Докладываю недостающие файлы playerokapi из архива...")
     try:
-        import certifi
+        with urllib.request.urlopen(ARCHIVE_URL, timeout=60) as r:
+            raw = r.read()
+        zf = zipfile.ZipFile(io.BytesIO(raw))
 
-        shutil.copyfile(certifi.where(), dest)
-        log.info("cacert.pem взят из certifi -> %s", dest)
-        return
-    except Exception:
-        log.info("certifi недоступен, качаю cacert.pem из репозитория")
+        # Внутри архива всё лежит под PlayerokAPI-main/playerokapi/...
+        prefix = None
+        for name in zf.namelist():
+            if "/playerokapi/" in name:
+                prefix = name.split("/playerokapi/")[0] + "/playerokapi/"
+                break
+        if prefix is None:
+            raise RuntimeError("в архиве не найден каталог playerokapi")
 
-    try:
-        with urllib.request.urlopen(CACERT_URL, timeout=30) as r:
-            data = r.read()
-        if len(data) < 1000:
-            raise RuntimeError("подозрительно маленький cacert.pem")
-        with open(dest, "wb") as f:
-            f.write(data)
-        log.info("cacert.pem загружен -> %s", dest)
+        copied = 0
+        for name in zf.namelist():
+            if not name.startswith(prefix) or name.endswith("/"):
+                continue
+            rel = name[len(prefix):]                      # напр. listener/events.py
+            dest = os.path.join(pkg_dir, rel)
+            if os.path.exists(dest):
+                continue
+            os.makedirs(os.path.dirname(dest) or pkg_dir, exist_ok=True)
+            with zf.open(name) as src, open(dest, "wb") as out:
+                out.write(src.read())
+            copied += 1
+        log.info("Доложено файлов: %d -> %s", copied, pkg_dir)
+
+        # cacert.pem: если в архиве его не оказалось — берём из certifi
+        cacert = os.path.join(pkg_dir, "cacert.pem")
+        if not os.path.exists(cacert):
+            import certifi
+
+            shutil.copyfile(certifi.where(), cacert)
+            log.info("cacert.pem взят из certifi")
     except Exception:
         log.exception(
-            "Не удалось подготовить cacert.pem. Подключение к Playerok упадёт."
+            "Не удалось доукомплектовать playerokapi. Подключение упадёт."
         )
-
-
-@dataclass
-class Order:
-    """Нормализованный заказ, независимый от библиотеки."""
-    id: str            # ID сделки
-    item_id: str       # ID лота
-    item_name: str     # Название лота
-    chat_id: str | None
-    buyer: str | None
-
-
-@dataclass
-class IncomingMessage:
-    """Сообщение от покупателя в чате сделки."""
-    chat_id: str
-    text: str
-    user_id: str
-    username: str | None
-
-
-OrderHandler = Callable[[Order], Awaitable[None]]
-MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 
 
 class PlayerokMarket:
@@ -112,7 +115,7 @@ class PlayerokMarket:
 
     def connect(self):
         """Логинится по cookies. Бросает исключение, если сессия мертва."""
-        ensure_cacert()
+        ensure_playerokapi()
         from playerokapi.account import Account
 
         kwargs = {

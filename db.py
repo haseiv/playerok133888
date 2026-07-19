@@ -222,6 +222,54 @@ class Storage:
         cur = await self.db.execute("SELECT COUNT(*) c FROM accounts")
         return (await cur.fetchone())["c"]
 
+    async def delete_account(self, account_id: int) -> str:
+        """Удаляет один аккаунт. Возвращает: ok | not_found | busy.
+
+        Аккаунт в активной аренде удалять нельзя — арендатор потеряет доступ
+        посреди оплаченного срока.
+        """
+        acc = await self.account_by_id(account_id)
+        if acc is None:
+            return "not_found"
+        if acc.status == "rented":
+            return "busy"
+        await self.db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+        await self.db.commit()
+        await self.log(account_id, "account_deleted", acc.product)
+        return "ok"
+
+    async def delete_product(self, product: str) -> tuple[str, int]:
+        """Удаляет товар целиком: его настройки, связки лотов и все свободные
+        аккаунты. Возвращает (статус, сколько_аккаунтов_удалено).
+
+        Статус: ok | not_found | busy. busy — если есть аккаунты в аренде:
+        тогда не трогаем ничего, чтобы не оборвать активные сделки.
+        """
+        accs = await self.all_accounts(product)
+        settings = await self.product_settings_exists(product)
+        if not accs and not settings:
+            return ("not_found", 0)
+
+        if any(a.status == "rented" for a in accs):
+            return ("busy", 0)
+
+        # Удаляем только свободные/проданные/на проверке — активных аренд нет
+        cur = await self.db.execute(
+            "DELETE FROM accounts WHERE product=?", (product,)
+        )
+        deleted = cur.rowcount
+        await self.db.execute("DELETE FROM products WHERE product=?", (product,))
+        await self.db.execute("DELETE FROM lot_map WHERE product=?", (product,))
+        await self.db.commit()
+        await self.log(None, "product_deleted", f"{product}:{deleted}")
+        return ("ok", deleted)
+
+    async def product_settings_exists(self, product: str) -> bool:
+        cur = await self.db.execute(
+            "SELECT 1 FROM products WHERE product=? LIMIT 1", (product,)
+        )
+        return await cur.fetchone() is not None
+
     async def set_status(self, account_id: int, status: str) -> bool:
         cur = await self.db.execute(
             "UPDATE accounts SET status=? WHERE id=?", (status, account_id)

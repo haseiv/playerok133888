@@ -299,6 +299,81 @@ async def cmd_endrent(msg: Message, command: CommandObject):
     await msg.answer("У этого аккаунта нет активной аренды.")
 
 
+@dp.message(Command("delproduct"))
+async def cmd_delproduct(msg: Message, command: CommandObject):
+    """/delproduct <товар> — удалить товар со всеми свободными аккаунтами."""
+    if not is_admin(msg.from_user.id):
+        return
+    product = (command.args or "").strip()
+    if not product:
+        await msg.answer(
+            "Использование: <code>/delproduct peak</code>\n"
+            "Удалит настройки товара, связки лотов и все его свободные аккаунты.\n"
+            "Аккаунты в аренде не тронет."
+        )
+        return
+    # Подтверждение: удаление необратимо
+    accs = await storage.all_accounts(product)
+    free = sum(1 for a in accs if a.status != "rented")
+    rented = sum(1 for a in accs if a.status == "rented")
+    warn = f"\n⚠️ В аренде: {rented} — они блокируют удаление." if rented else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delp:{product}"),
+        InlineKeyboardButton(text="Отмена", callback_data="delp:cancel"),
+    ]])
+    await msg.answer(
+        f"Удалить товар <b>{html.escape(product)}</b>?\n"
+        f"Будет удалено аккаунтов: {free}{warn}",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("delp:"))
+async def cb_delproduct(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    arg = cb.data.split(":", 1)[1]
+    if arg == "cancel":
+        await cb.message.edit_text("Удаление отменено.")
+        await cb.answer()
+        return
+    status, deleted = await storage.delete_product(arg)
+    if status == "busy":
+        await cb.message.edit_text(
+            f"❌ Нельзя удалить <b>{html.escape(arg)}</b>: есть аккаунты в аренде. "
+            f"Дождитесь окончания или /endrent."
+        )
+    elif status == "not_found":
+        await cb.message.edit_text(f"Товар <b>{html.escape(arg)}</b> не найден.")
+    else:
+        await cb.message.edit_text(
+            f"✅ Товар <b>{html.escape(arg)}</b> удалён. "
+            f"Аккаунтов удалено: {deleted}."
+        )
+    await cb.answer()
+
+
+@dp.message(Command("delacc"))
+async def cmd_delacc(msg: Message, command: CommandObject):
+    """/delacc <id> — удалить один аккаунт."""
+    if not is_admin(msg.from_user.id):
+        return
+    arg = (command.args or "").strip().lstrip("#")
+    if not arg.isdigit():
+        await msg.answer("Использование: <code>/delacc 12</code>")
+        return
+    status = await storage.delete_account(int(arg))
+    if status == "busy":
+        await msg.answer(
+            f"❌ Аккаунт #{arg} в аренде — удалять нельзя. Сначала /endrent {arg}."
+        )
+    elif status == "not_found":
+        await msg.answer("Нет такого аккаунта.")
+    else:
+        await msg.answer(f"✅ Аккаунт #{arg} удалён.")
+
+
 @dp.message(Command("link"))
 async def cmd_link(msg: Message, command: CommandObject):
     """/link <id или название лота> = <товар>"""
@@ -529,11 +604,48 @@ async def cb_account_one(cb: CallbackQuery):
     if acc.status == "rented":
         kb.append([InlineKeyboardButton(text="⛔️ Прекратить аренду",
                                         callback_data=f"acc:endrent:{acc.id}")])
+    else:
+        # Удалять можно всё, кроме аккаунта в активной аренде
+        kb.append([InlineKeyboardButton(text="🗑 Удалить аккаунт",
+                                        callback_data=f"accdel:{acc.id}")])
     kb.append([InlineKeyboardButton(text="⬅️ К списку", callback_data="acc:all:0")])
 
     await cb.message.edit_text("\n".join(lines),
                                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("accdel:"))
+async def cb_account_del(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc_id = int(cb.data.split(":")[2])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"accdelok:{acc_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data=f"acc:one:{acc_id}"),
+    ]])
+    await cb.message.edit_text(
+        f"Точно удалить аккаунт #{acc_id}? Это необратимо.", reply_markup=kb
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("accdelok:"))
+async def cb_account_delyes(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc_id = int(cb.data.split(":")[2])
+    status = await storage.delete_account(acc_id)
+    if status == "busy":
+        await cb.answer("Аккаунт в аренде — нельзя.", show_alert=True)
+        cb.data = f"acc:one:{acc_id}"
+        await cb_account_one(cb)
+        return
+    await cb.answer("Удалён 🗑", show_alert=True)
+    cb.data = "acc:all:0"
+    await cb_accounts_all(cb)
 
 
 @dp.callback_query(F.data.startswith("acc:pw:"))

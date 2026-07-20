@@ -397,6 +397,30 @@ async def cmd_delacc(msg: Message, command: CommandObject):
         await msg.answer(f"✅ Аккаунт #{arg} удалён.")
 
 
+@dp.message(Command("methods"))
+async def cmd_methods(msg: Message):
+    """Показывает методы Account — чтобы найти имя для CONFIRM_METHOD."""
+    if not is_admin(msg.from_user.id):
+        return
+    if market is None:
+        await msg.answer("Playerok не подключён.")
+        return
+    try:
+        methods = [m for m in dir(market.account) if not m.startswith("_")
+                   and callable(getattr(market.account, m, None))]
+    except Exception as e:
+        await msg.answer(f"Ошибка: {html.escape(str(e))}")
+        return
+    # Подсвечиваем кандидатов на подтверждение
+    hint = [m for m in methods
+            if any(w in m.lower() for w in ("complete", "confirm", "finish", "deal", "order"))]
+    text = "<b>Методы Account:</b>\n<code>" + ", ".join(methods) + "</code>"
+    if hint:
+        text += ("\n\n<b>Похоже на подтверждение:</b>\n<code>"
+                 + ", ".join(hint) + "</code>\n\nВпишите нужное в CONFIRM_METHOD.")
+    await msg.answer(text)
+
+
 @dp.message(Command("link"))
 async def cmd_link(msg: Message, command: CommandObject):
     """/link <id или название лота> = <товар>"""
@@ -928,11 +952,23 @@ async def handle_order(order: Order) -> None:
     kind = f"🕒 аренда {human_left(deal.seconds_left())}" if deal.is_rent else "💰 продажа"
     busy = await storage.active_slots(acc.id)
     slot_info = f" | слоты: {busy}/{slots}" if slots > 1 else ""
+
+    # Автоподтверждение — строго ПОСЛЕ успешной выдачи (ok == True).
+    # Так деньги не подтверждаются по сделкам, где данные не ушли.
+    confirm_line = ""
+    if cfg.auto_confirm:
+        confirmed = await market.confirm_deal(order.id, cfg.confirm_method)
+        if confirmed:
+            confirm_line = "\n✅ Сделка подтверждена автоматически"
+        else:
+            confirm_line = ("\n⚠️ Не удалось подтвердить автоматически — "
+                            "подтвердите вручную на Playerok")
+
     await notify_admins(
         f"🛒 <b>{html.escape(product)}</b> → аккаунт #{acc.id} "
         f"({html.escape(acc.login)})\n"
         f"{kind}{slot_info} | всего сдавался: {acc.rents_count}\n"
-        f"Покупатель: {html.escape(order.buyer or '—')}"
+        f"Покупатель: {html.escape(order.buyer or '—')}{confirm_line}"
     )
 
 

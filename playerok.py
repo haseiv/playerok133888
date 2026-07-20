@@ -175,6 +175,36 @@ class PlayerokMarket:
             log.exception("Playerok: не удалось отправить сообщение в чат %s", chat_id)
             return False
 
+    async def confirm_deal(self, deal_id: str, method_name: str = "") -> bool:
+        """Подтверждает передачу товара со стороны продавца.
+
+        method_name — имя метода библиотеки. Если пустое, пробуем набор
+        распространённых имён. Возвращает True только при реальном успехе;
+        при любой неудаче — False, чтобы вызывающий код мог предупредить вас,
+        а не считать сделку подтверждённой вслепую.
+        """
+        candidates = [method_name] if method_name else [
+            "complete_deal", "confirm_deal", "complete_order",
+            "confirm_order", "complete_transaction",
+        ]
+        loop = asyncio.get_running_loop()
+        for name in candidates:
+            fn = getattr(self.account, name, None)
+            if not callable(fn):
+                continue
+            try:
+                await loop.run_in_executor(None, lambda f=fn: f(deal_id))
+                log.info("Playerok: сделка %s подтверждена через %s()", deal_id, name)
+                return True
+            except Exception:
+                log.exception("Playerok: %s() не сработал для сделки %s", name, deal_id)
+                return False
+        log.error(
+            "Playerok: не найден метод подтверждения сделки. Задайте CONFIRM_METHOD "
+            "в .env. Доступные методы: см. dir(Account)."
+        )
+        return False
+
     # ---------- слушатель ----------
 
     def _dispatch(self, coro, loop: asyncio.AbstractEventLoop, what: str) -> None:

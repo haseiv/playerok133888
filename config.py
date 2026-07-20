@@ -29,6 +29,16 @@ class Config:
     rental_maintenance: bool = os.getenv("RENTAL_MAINTENANCE", "false").lower() in (
         "1", "true", "yes", "да"
     )
+    # Автоподтверждение сделки после успешной выдачи. По умолчанию ВЫКЛ:
+    # подтверждение переводит деньги, ошибка тут дороже удобства.
+    auto_confirm: bool = os.getenv("AUTO_CONFIRM", "false").lower() in (
+        "1", "true", "yes", "да"
+    )
+    # Имя метода подтверждения в playerokapi.account.Account. У разных версий
+    # библиотеки оно может отличаться, поэтому вынесено в настройку. Узнать:
+    #   python -c "from playerokapi.account import Account; print([m for m in dir(Account) if not m.startswith('_')])"
+    # и вписать сюда подходящее (напр. complete_deal / confirm_deal).
+    confirm_method: str = os.getenv("CONFIRM_METHOD", "")
     bot_username: str = os.getenv("BOT_USERNAME", "")
 
     def validate(self) -> None:

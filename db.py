@@ -16,12 +16,30 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 import time
 import uuid
 from dataclasses import dataclass
 
 import aiosqlite
+
+
+def normalize_title(s: str) -> str:
+    """Приводит название к виду, устойчивому к эмодзи и пробелам.
+
+    Проблема: в названии лота на Playerok эмодзи могут отличаться от
+    введённых в боте невидимыми символами (variation selector ♾️ vs ♾),
+    из-за чего точное сравнение строк не находит совпадения. Здесь мы
+    выкидываем всё, кроме букв и цифр, и приводим к нижнему регистру —
+    остаётся смысловое ядро названия, по которому и сопоставляем.
+    """
+    if not s:
+        return ""
+    # Оставляем буквы/цифры любых алфавитов, остальное (эмодзи, пробелы,
+    # знаки, variation selectors) убираем.
+    cleaned = re.sub(r"[^\w]", "", s, flags=re.UNICODE)
+    return cleaned.casefold()
 
 from config import cfg
 from crypto import decrypt, encrypt
@@ -339,6 +357,14 @@ class Storage:
         return cur.rowcount > 0
 
     async def resolve_product(self, item_id: str, item_name: str) -> str | None:
+        """Находит товар для оплаченного лота.
+
+        Порядок: 1) явная связка по ID лота (самое надёжное);
+                 2) явная связка по точному названию;
+                 3) нормализованное сравнение названия с товарами склада
+                    (устойчиво к эмодзи и пробелам — см. normalize_title).
+        """
+        # 1-2: явные связки из lot_map
         cur = await self.db.execute(
             "SELECT product FROM lot_map WHERE key IN (?, ?) "
             "ORDER BY CASE key WHEN ? THEN 0 ELSE 1 END LIMIT 1",
@@ -347,10 +373,16 @@ class Storage:
         row = await cur.fetchone()
         if row:
             return row["product"]
-        cur = await self.db.execute(
-            "SELECT 1 FROM accounts WHERE product=? LIMIT 1", (item_name,)
-        )
-        return item_name if await cur.fetchone() else None
+
+        # 3: сравнение по нормализованному названию.
+        target = normalize_title(item_name)
+        if not target:
+            return None
+        cur = await self.db.execute("SELECT DISTINCT product FROM accounts")
+        for r in await cur.fetchall():
+            if normalize_title(r["product"]) == target:
+                return r["product"]
+        return None
 
     # ---------- сделки ----------
 

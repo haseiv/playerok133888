@@ -53,6 +53,21 @@ class EditNote(StatesGroup):
     waiting_text = State()
 
 
+class AddText(StatesGroup):
+    waiting_name = State()
+    waiting_body = State()
+
+
+class AddFile(StatesGroup):
+    waiting_name = State()
+    waiting_doc = State()
+
+
+class AddCodes(StatesGroup):
+    waiting_name = State()
+    waiting_codes = State()
+
+
 @dp.message(Command("add"))
 async def cmd_add(msg: Message, state: FSMContext):
     if not is_admin(msg.from_user.id):
@@ -143,6 +158,132 @@ async def got_note(msg: Message, state: FSMContext):
         await msg.answer(f"📝 Заметка для #{acc_id} сохранена.")
     else:
         await msg.answer(f"📝 Заметка для #{acc_id} очищена.")
+
+
+# ─────────────── цифровые товары: текст / файл / коды ───────────────
+
+@dp.message(Command("addtext"))
+async def cmd_addtext(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    await state.set_state(AddText.waiting_name)
+    await msg.answer(
+        "📄 Безлимитный текстовый товар (гайд, инструкция).\n"
+        "Название товара (как на Playerok). /cancel — отмена."
+    )
+
+
+@dp.message(AddText.waiting_name, F.text)
+async def addtext_name(msg: Message, state: FSMContext):
+    await state.update_data(name=msg.text.strip())
+    await state.set_state(AddText.waiting_body)
+    await msg.answer("Пришлите текст, который бот будет выдавать покупателям.")
+
+
+@dp.message(AddText.waiting_body, F.text)
+async def addtext_body(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    await storage.set_digital_text(data["name"], msg.text)
+    await state.clear()
+    await msg.answer(
+        f"✅ Текстовый товар <b>{html.escape(data['name'])}</b> готов. "
+        f"Выдаётся всем покупателям автоматически."
+    )
+
+
+@dp.message(Command("addfile"))
+async def cmd_addfile(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    await state.set_state(AddFile.waiting_name)
+    await msg.answer(
+        "📎 Безлимитный файловый товар (конфиг, архив).\n"
+        "Название товара (как на Playerok). /cancel — отмена."
+    )
+
+
+@dp.message(AddFile.waiting_name, F.text)
+async def addfile_name(msg: Message, state: FSMContext):
+    await state.update_data(name=msg.text.strip())
+    await state.set_state(AddFile.waiting_doc)
+    await msg.answer("Пришлите файл документом.")
+
+
+@dp.message(AddFile.waiting_doc, F.document)
+async def addfile_doc(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    await storage.set_digital_file(
+        data["name"], msg.document.file_id, msg.document.file_name or "file"
+    )
+    await state.clear()
+    await msg.answer(
+        f"✅ Файловый товар <b>{html.escape(data['name'])}</b> готов. "
+        f"Покупатель получит ссылку и заберёт файл здесь."
+    )
+
+
+@dp.message(Command("addcodes"))
+async def cmd_addcodes(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    await state.set_state(AddCodes.waiting_name)
+    await msg.answer(
+        "🔑 Товар-пул кодов (ключи, промокоды). Каждый выдаётся один раз.\n"
+        "Название товара (как на Playerok). /cancel — отмена."
+    )
+
+
+@dp.message(AddCodes.waiting_name, F.text)
+async def addcodes_name(msg: Message, state: FSMContext):
+    await state.update_data(name=msg.text.strip())
+    await state.set_state(AddCodes.waiting_codes)
+    await msg.answer("Пришлите коды — по одному на строку.")
+
+
+@dp.message(AddCodes.waiting_codes, F.text)
+async def addcodes_body(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    codes = [c.strip() for c in msg.text.splitlines() if c.strip()]
+    if not codes:
+        await msg.answer("Не вижу кодов. Пришлите по одному на строку.")
+        return
+    await storage.make_codes_product(data["name"])
+    n = await storage.add_codes(data["name"], codes)
+    await state.clear()
+    await msg.answer(
+        f"✅ Товар <b>{html.escape(data['name'])}</b>: добавлено кодов — {n}. "
+        f"Выдаются по одному за покупку."
+    )
+    # сообщение с кодами лучше убрать
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+@dp.message(Command("digital"))
+async def cmd_digital(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    rows = await storage.all_digital()
+    if not rows:
+        await msg.answer(
+            "Цифровых товаров нет.\n"
+            "/addtext — гайд/текст · /addfile — файл · /addcodes — пул ключей"
+        )
+        return
+    labels = {"text": "текст", "file": "файл", "codes": "коды"}
+    lines = []
+    for r in rows:
+        extra = ""
+        if r["kind"] == "codes":
+            left = await storage.codes_left(r["product"])
+            extra = f", осталось {left}"
+        lines.append(
+            f"• <b>{html.escape(r['product'])}</b> — {labels.get(r['kind'], r['kind'])}"
+            f" (продано {r['sold_count']}{extra})"
+        )
+    await msg.answer("<b>Цифровые товары:</b>\n" + "\n".join(lines))
 
 
 # ─────────────────────────── админ-команды ───────────────────────────
@@ -516,6 +657,24 @@ def _code_kb(token: str) -> InlineKeyboardMarkup:
 @dp.message(CommandStart(deep_link=True))
 async def start_with_token(msg: Message, command: CommandObject):
     token = (command.args or "").strip()
+
+    # Файловый токен цифрового товара: start=file_<token>
+    if token.startswith("file_"):
+        data = _file_tokens.get(token[5:])
+        if data is None:
+            await msg.answer("❌ Ссылка недействительна или устарела.")
+            return
+        if data.get("file_id"):
+            await msg.answer_document(
+                data["file_id"],
+                caption=f"✅ Ваш файл: {data.get('file_name') or 'файл'}"
+            )
+        if data.get("gift_file_id"):
+            await msg.answer_document(data["gift_file_id"], caption="🎁 Подарок")
+        if data.get("gift_text"):
+            await msg.answer(f"🎁 Подарок:\n{data['gift_text']}")
+        return
+
     found = await storage.deal_by_token(token)
     if found is None:
         await msg.answer("❌ Код выдачи не найден.")
@@ -551,7 +710,9 @@ def _panel_text() -> str:
         "<b>🛍 Панель продавца</b>\n\n"
         "Управляйте складом кнопками ниже.\n"
         "Команды тоже работают: /add, /rent, /link, /issue.\n\n"
-        "Добавить аккаунт — /add"
+        "<b>Товары:</b>\n"
+        "/add — Steam-аккаунт · /addtext — гайд · /addfile — файл · /addcodes — ключи\n"
+        "/digital — список цифровых товаров"
     )
 
 
@@ -899,6 +1060,59 @@ def _access_text(acc: Account, deal: Deal, mafile: MaFile, shared: bool) -> str:
 
 # ─────────────────────────── выдача по заказу ───────────────────────────
 
+# Токены для выдачи файлов через Telegram: token -> данные цифрового товара.
+# Файл нельзя отдать в чат Playerok (там только текст), поэтому покупатель
+# переходит по ссылке в Telegram-бота, а токен говорит боту, что отдать.
+_file_tokens: dict[str, dict] = {}
+
+
+async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str) -> None:
+    status = "✅ выдано" if ok else "❌ НЕ отправлено — выдайте вручную"
+    await notify_admins(
+        f"🛒 Продан цифровой товар <b>{html.escape(product)}</b> ({what})\n"
+        f"Покупатель: {html.escape(order.buyer or '—')}\n"
+        f"Статус: {status}"
+    )
+
+
+async def _deliver_digital(order: "Order", product: str, digital: dict) -> None:
+    """Выдаёт цифровой товар: текст/коды в чат, файл — ссылкой в Telegram."""
+    import secrets as _secrets
+    kind = digital["kind"]
+    gift_note = ""
+    if digital.get("gift_text"):
+        gift_note = f"\n\n🎁 Подарок:\n{digital['gift_text']}"
+
+    if kind == "text":
+        ok = await market.send_message(order.chat_id,
+            f"✅ Спасибо за покупку!\n\n{digital['text'] or ''}{gift_note}")
+        await storage.digital_sold_inc(product)
+        await _digital_admin_note(order, product, ok, "текст")
+        return
+
+    if kind == "codes":
+        code = await storage.take_code(product, order_id=order.id)
+        if code is None:
+            await notify_admins(f"⚠️ Заказ {order.id}: коды <b>{html.escape(product)}</b> кончились! Пополните: /addcodes")
+            return
+        ok = await market.send_message(order.chat_id,
+            f"✅ Спасибо за покупку!\n\nВаш код: {code}{gift_note}")
+        await storage.digital_sold_inc(product)
+        left = await storage.codes_left(product)
+        await _digital_admin_note(order, product, ok, f"код (осталось {left})")
+        return
+
+    if kind == "file":
+        token = _secrets.token_urlsafe(9)
+        _file_tokens[token] = digital
+        link = f"https://t.me/{cfg.bot_username}?start=file_{token}"
+        ok = await market.send_message(order.chat_id,
+            f"✅ Спасибо за покупку!\n\nЗаберите файл здесь: {link}{gift_note}")
+        await storage.digital_sold_inc(product)
+        await _digital_admin_note(order, product, ok, "файл (ссылка)")
+        return
+
+
 async def handle_order(order: Order) -> None:
     # Площадка может прислать событие повторно (переподключение, ретрай).
     # Второй раз выдавать аккаунт нельзя.
@@ -921,6 +1135,12 @@ async def handle_order(order: Order) -> None:
             f"⚠️ Заказ {order.id} (<b>{html.escape(product)}</b>) без чата сделки. "
             f"Выдайте вручную: <code>/issue {product}</code>"
         )
+        return
+
+    # Цифровой товар (текст / файл / коды) — проверяем до Steam-аккаунтов.
+    digital = await storage.get_digital(product)
+    if digital is not None:
+        await _deliver_digital(order, product, digital)
         return
 
     taken = await storage.take_account(product, order_id=order.id, chat_id=order.chat_id)

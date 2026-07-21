@@ -59,6 +59,36 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status, product);
 
+-- Цифровой товар: текст / файл / пул кодов. Отдельно от Steam-аккаунтов,
+-- потому что у них разная природа выдачи.
+--   kind = 'text'  -> выдаём text_content всем (безлимит)
+--   kind = 'file'  -> выдаём файл file_id всем (безлимит)
+--   kind = 'codes' -> выдаём по одному коду из пула codes (штучно)
+-- gift_* — опциональный подарок, уходит вместе с основным товаром.
+CREATE TABLE IF NOT EXISTS digital_products (
+    product       TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    text_enc      BLOB,                -- зашифрованный текст (kind=text)
+    file_id       TEXT,               -- telegram file_id (kind=file)
+    file_name     TEXT,
+    gift_text_enc BLOB,               -- подарок текстом
+    gift_file_id  TEXT,
+    gift_file_name TEXT,
+    sold_count    INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL
+);
+
+-- Пул кодов для kind='codes': каждый выдаётся один раз.
+CREATE TABLE IF NOT EXISTS codes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    product    TEXT NOT NULL,
+    code_enc   BLOB NOT NULL,
+    used       INTEGER NOT NULL DEFAULT 0,
+    order_id   TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codes_pool ON codes(product, used);
+
 -- Настройки товара. rental_hours = 0 -> продажа навсегда.
 CREATE TABLE IF NOT EXISTS products (
     product      TEXT PRIMARY KEY,
@@ -378,10 +408,17 @@ class Storage:
         target = normalize_title(item_name)
         if not target:
             return None
+        # Собираем названия и из аккаунтов, и из цифровых товаров.
+        names: set[str] = set()
         cur = await self.db.execute("SELECT DISTINCT product FROM accounts")
         for r in await cur.fetchall():
-            if normalize_title(r["product"]) == target:
-                return r["product"]
+            names.add(r["product"])
+        cur = await self.db.execute("SELECT product FROM digital_products")
+        for r in await cur.fetchall():
+            names.add(r["product"])
+        for name in names:
+            if normalize_title(name) == target:
+                return name
         return None
 
     # ---------- сделки ----------
@@ -543,6 +580,117 @@ class Storage:
             (account_id, kind, payload, int(time.time())),
         )
         await self.db.commit()
+
+    # ---------- цифровые товары (текст / файл / коды) ----------
+
+    async def set_digital_text(self, product: str, text: str,
+                               gift_text: str | None = None) -> None:
+        await self.db.execute(
+            "INSERT INTO digital_products (product, kind, text_enc, gift_text_enc, "
+            "created_at) VALUES (?, 'text', ?, ?, ?) "
+            "ON CONFLICT(product) DO UPDATE SET kind='text', text_enc=excluded.text_enc, "
+            "gift_text_enc=excluded.gift_text_enc",
+            (product, encrypt(text), encrypt(gift_text) if gift_text else None,
+             int(time.time())),
+        )
+        await self.db.commit()
+
+    async def set_digital_file(self, product: str, file_id: str, file_name: str) -> None:
+        await self.db.execute(
+            "INSERT INTO digital_products (product, kind, file_id, file_name, "
+            "created_at) VALUES (?, 'file', ?, ?, ?) "
+            "ON CONFLICT(product) DO UPDATE SET kind='file', file_id=excluded.file_id, "
+            "file_name=excluded.file_name",
+            (product, file_id, file_name, int(time.time())),
+        )
+        await self.db.commit()
+
+    async def set_gift_file(self, product: str, file_id: str, file_name: str) -> bool:
+        cur = await self.db.execute(
+            "UPDATE digital_products SET gift_file_id=?, gift_file_name=? WHERE product=?",
+            (file_id, file_name, product),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def make_codes_product(self, product: str) -> None:
+        """Помечает товар как пул кодов (сами коды добавляются отдельно)."""
+        await self.db.execute(
+            "INSERT INTO digital_products (product, kind, created_at) "
+            "VALUES (?, 'codes', ?) "
+            "ON CONFLICT(product) DO UPDATE SET kind='codes'",
+            (product, int(time.time())),
+        )
+        await self.db.commit()
+
+    async def add_codes(self, product: str, codes: list[str]) -> int:
+        now = int(time.time())
+        await self.db.executemany(
+            "INSERT INTO codes (product, code_enc, created_at) VALUES (?,?,?)",
+            [(product, encrypt(c), now) for c in codes],
+        )
+        await self.db.commit()
+        return len(codes)
+
+    async def get_digital(self, product: str) -> dict | None:
+        cur = await self.db.execute(
+            "SELECT * FROM digital_products WHERE product=?", (product,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "product": row["product"],
+            "kind": row["kind"],
+            "text": decrypt(row["text_enc"]) if row["text_enc"] else None,
+            "file_id": row["file_id"],
+            "file_name": row["file_name"],
+            "gift_text": decrypt(row["gift_text_enc"]) if row["gift_text_enc"] else None,
+            "gift_file_id": row["gift_file_id"],
+            "gift_file_name": row["gift_file_name"],
+            "sold_count": row["sold_count"],
+        }
+
+    async def take_code(self, product: str, order_id: str | None = None) -> str | None:
+        """Выдаёт один неиспользованный код из пула. Атомарно."""
+        async with self._take_lock:
+            cur = await self.db.execute(
+                "UPDATE codes SET used=1, order_id=? "
+                "WHERE id=(SELECT id FROM codes WHERE product=? AND used=0 "
+                "          ORDER BY id LIMIT 1) RETURNING code_enc",
+                (order_id, product),
+            )
+            row = await cur.fetchone()
+            await self.db.commit()
+            return decrypt(row["code_enc"]) if row else None
+
+    async def codes_left(self, product: str) -> int:
+        cur = await self.db.execute(
+            "SELECT COUNT(*) c FROM codes WHERE product=? AND used=0", (product,)
+        )
+        return (await cur.fetchone())["c"]
+
+    async def digital_sold_inc(self, product: str) -> None:
+        await self.db.execute(
+            "UPDATE digital_products SET sold_count=sold_count+1 WHERE product=?",
+            (product,),
+        )
+        await self.db.commit()
+
+    async def all_digital(self) -> list[dict]:
+        cur = await self.db.execute(
+            "SELECT product, kind, sold_count FROM digital_products ORDER BY product"
+        )
+        return [{"product": r["product"], "kind": r["kind"],
+                 "sold_count": r["sold_count"]} for r in await cur.fetchall()]
+
+    async def delete_digital(self, product: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM digital_products WHERE product=?", (product,)
+        )
+        await self.db.execute("DELETE FROM codes WHERE product=?", (product,))
+        await self.db.commit()
+        return cur.rowcount > 0
 
 
 storage = Storage()

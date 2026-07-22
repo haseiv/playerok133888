@@ -429,6 +429,43 @@ class Storage:
         )
         return await cur.fetchone() is not None
 
+    async def take_shared(self, product: str, order_id: str | None = None,
+                          chat_id: str | None = None) -> tuple[Account, Deal] | None:
+        """Выдаёт общий аккаунт (status='shared').
+
+        В отличие от take_account: аккаунт НЕ занимается и НЕ списывается —
+        один и тот же выдаётся бесконечному числу покупателей. Сделка
+        записывается для истории и защиты от повторной выдачи по тому же
+        заказу, но слоты не считаются.
+        """
+        async with self._take_lock:
+            cur = await self.db.execute(
+                "SELECT * FROM accounts WHERE product=? AND status='shared' "
+                "ORDER BY id LIMIT 1",
+                (product,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+
+            acc = _account(row)
+            await self.db.execute(
+                "UPDATE accounts SET rents_count=rents_count+1 WHERE id=?", (acc.id,)
+            )
+            token = secrets.token_urlsafe(9)
+            oid = order_id or f"manual-{uuid.uuid4().hex[:12]}"
+            now = int(time.time())
+            await self.db.execute(
+                "INSERT INTO deals (order_id, account_id, chat_id, token, kind, "
+                "ends_at, created_at) VALUES (?,?,?,?,'shared',NULL,?)",
+                (oid, acc.id, chat_id, token, now),
+            )
+            await self.db.commit()
+            await self.log(acc.id, "shared_issued", oid)
+
+            cur = await self.db.execute("SELECT * FROM deals WHERE order_id=?", (oid,))
+            return acc, _deal(await cur.fetchone())
+
     async def take_account(self, product: str, order_id: str | None = None,
                            chat_id: str | None = None) -> tuple[Account, Deal] | None:
         """Занимает свободный слот на аккаунте под сделку.

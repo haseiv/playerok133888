@@ -261,6 +261,36 @@ async def addcodes_body(msg: Message, state: FSMContext):
         pass
 
 
+@dp.message(Command("shared"))
+async def cmd_shared(msg: Message, command: CommandObject):
+    """/shared <id> — сделать аккаунт общим (безлимитная выдача)."""
+    if not is_admin(msg.from_user.id):
+        return
+    arg = (command.args or "").strip().lstrip("#")
+    if not arg.isdigit():
+        await msg.answer(
+            "Использование: <code>/shared 12</code>\n\n"
+            "Аккаунт станет ОБЩИМ: выдаётся бесконечно всем покупателям, "
+            "не списывается со склада.\n"
+            "В выдаче бот честно пишет, что доступ общий и нужен офлайн-режим — "
+            "это снимает споры и возвраты.\n\n"
+            "Вернуть в обычный режим: <code>/free 12</code>"
+        )
+        return
+    acc = await storage.account_by_id(int(arg))
+    if acc is None:
+        await msg.answer("Нет такого аккаунта.")
+        return
+    if acc.status == "rented":
+        await msg.answer(f"❌ Аккаунт #{acc.id} сейчас в аренде. Сначала /endrent {acc.id}.")
+        return
+    await storage.set_status(acc.id, "shared")
+    await msg.answer(
+        f"♾️ Аккаунт #{acc.id} (<code>{html.escape(acc.login)}</code>) теперь ОБЩИЙ.\n"
+        f"Продаётся бесконечно, со склада не списывается."
+    )
+
+
 @dp.message(Command("digital"))
 async def cmd_digital(msg: Message):
     if not is_admin(msg.from_user.id):
@@ -688,9 +718,9 @@ async def start_with_token(msg: Message, command: CommandObject):
 
 
 STATUS_EMOJI = {"free": "🟢", "rented": "🔴", "sold": "⚫",
-                "maintenance": "🔧"}
+                "maintenance": "🔧", "shared": "♾️"}
 STATUS_LABEL = {"free": "свободен", "rented": "в аренде", "sold": "продан",
-                "maintenance": "на проверке"}
+                "maintenance": "на проверке", "shared": "общий (безлимит)"}
 PAGE_SIZE = 8
 
 
@@ -798,6 +828,12 @@ async def _render_account_card(cb: CallbackQuery, acc_id: int) -> None:
     kb = [[InlineKeyboardButton(text="🔑 Показать пароль",
                                 callback_data=f"acc:pw:{acc.id}")]]
     kb.append([InlineKeyboardButton(text="📝 Заметка", callback_data=f"acc:note:{acc.id}")])
+    if acc.status == "shared":
+        kb.append([InlineKeyboardButton(text="↩️ Обычный режим",
+                                        callback_data=f"acc:free:{acc.id}")])
+    elif acc.status in ("free", "maintenance"):
+        kb.append([InlineKeyboardButton(text="♾️ Сделать общим",
+                                        callback_data=f"acc:share:{acc.id}")])
     if acc.status == "maintenance":
         kb.append([InlineKeyboardButton(text="✅ Вернуть в оборот",
                                         callback_data=f"acc:free:{acc.id}")])
@@ -896,6 +932,21 @@ async def cb_account_note(cb: CallbackQuery, state: FSMContext):
         f"Чтобы очистить — отправьте <code>-</code>. Отмена — /cancel"
     )
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("acc:share:"))
+async def cb_account_share(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc_id = _cb_id(cb.data)
+    acc = await storage.account_by_id(acc_id)
+    if acc is None or acc.status == "rented":
+        await cb.answer("Сейчас нельзя.", show_alert=True)
+        return
+    await storage.set_status(acc_id, "shared")
+    await cb.answer("Аккаунт теперь общий ♾️ — продаётся бесконечно", show_alert=True)
+    await _render_account_card(cb, acc_id)
 
 
 @dp.callback_query(F.data.startswith("acc:free:"))
@@ -1067,11 +1118,18 @@ _file_tokens: dict[str, dict] = {}
 
 
 async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str) -> None:
+    # Автоподтверждение — только после успешной выдачи (ok=True),
+    # чтобы не подтверждать деньги по несработавшим сделкам.
+    confirm_line = ""
+    if ok and cfg.auto_confirm:
+        confirmed = await market.confirm_deal(order.id, cfg.confirm_method)
+        confirm_line = ("\n✅ Сделка подтверждена" if confirmed
+                        else "\n⚠️ Подтвердите вручную на Playerok")
     status = "✅ выдано" if ok else "❌ НЕ отправлено — выдайте вручную"
     await notify_admins(
         f"🛒 Продан цифровой товар <b>{html.escape(product)}</b> ({what})\n"
         f"Покупатель: {html.escape(order.buyer or '—')}\n"
-        f"Статус: {status}"
+        f"Статус: {status}{confirm_line}"
     )
 
 
@@ -1113,6 +1171,28 @@ async def _deliver_digital(order: "Order", product: str, digital: dict) -> None:
         return
 
 
+def _shared_text(acc: Account, mafile: MaFile) -> str:
+    """Текст выдачи общего аккаунта.
+
+    Прямо говорим покупателю, что доступ общий: это снимает споры и
+    возвраты, когда он обнаружит, что аккаунтом пользуется не он один.
+    """
+    return (
+        "🎮 Доступ выдан\n\n"
+        f"Логин: {acc.login}\n"
+        f"Пароль: {acc.password}\n\n"
+        f"Код Steam Guard: {mafile.code()}\n"
+        f"⏳ Код действует {mafile.seconds_left()} сек.\n\n"
+        "Код меняется каждые 30 секунд. Не успели — напишите «код», пришлю новый.\n\n"
+        "⚠️ ВАЖНО: аккаунт ОБЩИЙ, доступ у нескольких покупателей.\n"
+        "1. Войдите в Steam (код выше).\n"
+        "2. Steam → «Перейти в автономный режим».\n"
+        "3. Играйте.\n"
+        "Не меняйте пароль и не отвязывайте Steam Guard — иначе доступ "
+        "потеряете и вы, и остальные."
+    )
+
+
 async def handle_order(order: Order) -> None:
     # Площадка может прислать событие повторно (переподключение, ретрай).
     # Второй раз выдавать аккаунт нельзя.
@@ -1141,6 +1221,15 @@ async def handle_order(order: Order) -> None:
     digital = await storage.get_digital(product)
     if digital is not None:
         await _deliver_digital(order, product, digital)
+        return
+
+    # Общий аккаунт: выдаётся бесконечно, не занимается и не списывается.
+    shared = await storage.take_shared(product, order_id=order.id, chat_id=order.chat_id)
+    if shared is not None:
+        acc, deal = shared
+        mafile = MaFile.parse(acc.mafile)
+        ok = await market.send_message(order.chat_id, _shared_text(acc, mafile))
+        await _digital_admin_note(order, product, ok, f"общий аккаунт #{acc.id}")
         return
 
     taken = await storage.take_account(product, order_id=order.id, chat_id=order.chat_id)

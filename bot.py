@@ -568,6 +568,67 @@ async def cmd_delacc(msg: Message, command: CommandObject):
         await msg.answer(f"✅ Аккаунт #{arg} удалён.")
 
 
+@dp.message(Command("autoconfirm"))
+async def cmd_autoconfirm(msg: Message, command: CommandObject):
+    """Вкл/выкл автоподтверждение сделок без передеплоя."""
+    if not is_admin(msg.from_user.id):
+        return
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "вкл", "1", "true"):
+        cfg.auto_confirm = True
+        await msg.answer(
+            "✅ Автоподтверждение <b>включено</b>.\n"
+            "Сделки будут подтверждаться сразу после успешной выдачи.\n\n"
+            "⚠️ Для аренды это спорно: закрывает сделку сразу, а услуга длится "
+            "часами. Проверь на одной продаже."
+        )
+    elif arg in ("off", "выкл", "0", "false"):
+        cfg.auto_confirm = False
+        await msg.answer("⛔️ Автоподтверждение <b>выключено</b>. Подтверждаешь сам.")
+    else:
+        state = "включено ✅" if cfg.auto_confirm else "выключено ⛔️"
+        method = cfg.confirm_method or "автоопределение"
+        await msg.answer(
+            f"Автоподтверждение сейчас: <b>{state}</b>\n"
+            f"Метод: <code>{html.escape(method)}</code>\n\n"
+            "Включить: <code>/autoconfirm on</code>\n"
+            "Выключить: <code>/autoconfirm off</code>\n"
+            "Проверить метод: /testconfirm"
+        )
+
+
+@dp.message(Command("testconfirm"))
+async def cmd_testconfirm(msg: Message):
+    """Проверяет, находит ли бот метод подтверждения (без реальной сделки)."""
+    if not is_admin(msg.from_user.id):
+        return
+    if market is None:
+        await msg.answer("Playerok не подключён.")
+        return
+    try:
+        methods = [m for m in dir(market.account) if not m.startswith("_")
+                   and callable(getattr(market.account, m, None))]
+    except Exception as e:
+        await msg.answer(f"Ошибка: {html.escape(str(e))}")
+        return
+    hint = [m for m in methods
+            if any(w in m.lower() for w in ("complete", "confirm", "finish"))
+            and any(w in m.lower() for w in ("deal", "order", "item", "transaction"))]
+    if hint:
+        await msg.answer(
+            "✅ Бот нашёл вероятные методы подтверждения:\n<code>"
+            + ", ".join(hint) + "</code>\n\n"
+            "Автоопределение должно сработать само. Если нет — впиши точное имя "
+            "в CONFIRM_METHOD."
+        )
+    else:
+        await msg.answer(
+            "⚠️ Похожих методов не найдено. Полный список:\n<code>"
+            + ", ".join(methods) + "</code>\n\n"
+            "Найди подходящий и впиши в CONFIRM_METHOD."
+        )
+
+
 @dp.message(Command("methods"))
 async def cmd_methods(msg: Message):
     """Показывает методы Account — чтобы найти имя для CONFIRM_METHOD."""

@@ -176,58 +176,28 @@ class PlayerokMarket:
             return False
 
     async def confirm_deal(self, deal_id: str, method_name: str = "") -> bool:
-        """Подтверждает передачу товара со стороны продавца.
+        """Подтверждает выполнение сделки продавцом.
 
-        Если method_name пуст — сначала пробуем частые имена, потом ищем
-        любой метод Account, похожий на подтверждение (complete/confirm +
-        deal/order/item). Так в большинстве случаев CONFIRM_METHOD можно
-        не задавать вручную. Возвращает True только при реальном успехе.
+        По документации PlayerokAPI подтверждение = перевод сделки в статус
+        ItemDealStatuses.SENT («продавец подтвердил выполнение сделки»)
+        методом update_deal(deal_id, new_status). CONFIRMED здесь не
+        подходит — это статус, когда получение подтверждает покупатель.
+
+        method_name оставлен для совместимости с конфигом, но игнорируется.
         """
-        if method_name:
-            candidates = [method_name]
-        else:
-            common = [
-                "complete_deal", "confirm_deal", "complete_order", "confirm_order",
-                "complete_item", "confirm_item", "complete_transaction",
-                "deal_complete", "finish_deal",
-            ]
-            # добираем любые подходящие по имени методы из библиотеки
-            found = [
-                m for m in dir(self.account)
-                if not m.startswith("_")
-                and callable(getattr(self.account, m, None))
-                and any(w in m.lower() for w in ("complete", "confirm", "finish"))
-                and any(w in m.lower() for w in ("deal", "order", "item", "transaction"))
-            ]
-            # уникальные, сохраняя порядок: сначала общие, потом найденные
-            seen = set()
-            candidates = [c for c in common + found
-                          if not (c in seen or seen.add(c))]
+        from playerokapi.enums import ItemDealStatuses
 
         loop = asyncio.get_running_loop()
-        for name in candidates:
-            fn = getattr(self.account, name, None)
-            if not callable(fn):
-                continue
-            # У разных версий сигнатура может быть f(deal_id) или f(id=...).
-            for call in (lambda f=fn: f(deal_id),
-                         lambda f=fn: f(deal_id=deal_id),
-                         lambda f=fn: f(id=deal_id)):
-                try:
-                    await loop.run_in_executor(None, call)
-                    log.info("Playerok: сделка %s подтверждена через %s()",
-                             deal_id, name)
-                    return True
-                except TypeError:
-                    continue  # не та сигнатура — пробуем следующую
-                except Exception:
-                    log.exception("Playerok: %s() не сработал для %s", name, deal_id)
-                    break  # метод есть, но упал по сути — дальше не перебираем
-        log.error(
-            "Playerok: не найден рабочий метод подтверждения. Задайте CONFIRM_METHOD. "
-            "Список методов — командой /methods в боте."
-        )
-        return False
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: self.account.update_deal(deal_id, ItemDealStatuses.SENT),
+            )
+            log.info("Playerok: сделка %s подтверждена (SENT)", deal_id)
+            return True
+        except Exception:
+            log.exception("Playerok: update_deal(SENT) не сработал для %s", deal_id)
+            return False
 
     # ---------- слушатель ----------
 

@@ -175,6 +175,59 @@ class PlayerokMarket:
             log.exception("Playerok: не удалось отправить сообщение в чат %s", chat_id)
             return False
 
+    async def find_item_id(self, product_name: str) -> str | None:
+        """Ищет id своего лота по названию (для перевыкладки/поднятия)."""
+        loop = asyncio.get_running_loop()
+
+        def _find():
+            items = self.account.get_my_items()
+            lst = getattr(items, "items", items)
+            for it in lst:
+                if getattr(it, "name", "") == product_name:
+                    return getattr(it, "id", None)
+            return None
+
+        try:
+            return await loop.run_in_executor(None, _find)
+        except Exception:
+            log.exception("Playerok: не удалось найти лот %s", product_name)
+            return None
+
+    async def promote_item(self, item_id: str) -> tuple[bool, str]:
+        """Поднимает лот в премиум (платно). Возвращает (успех, сообщение).
+
+        Метод increase_item_priority_status тратит деньги с баланса Playerok,
+        поэтому при любой неясности возвращаем False и НЕ списываем лишнее.
+        Сигнатуру и имена полей уточняем на живой библиотеке — тут защита от
+        того, что структура ответа отличается от ожидаемой.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _promote():
+            statuses = self.account.get_item_priority_statuses(item_id)
+            lst = getattr(statuses, "priority_statuses", None) or statuses
+            premium = None
+            for st in lst:
+                label = (getattr(st, "name", "") or getattr(st, "type", "")
+                         or getattr(st, "status", "") or "").upper()
+                if "PREMIUM" in label:
+                    premium = st
+                    break
+            if premium is None:
+                return (False, "премиум-уровень не найден")
+            price = getattr(premium, "price", "?")
+            priority_id = (getattr(premium, "id", None)
+                           or getattr(premium, "type", None)
+                           or getattr(premium, "status", None))
+            self.account.increase_item_priority_status(item_id, priority_id)
+            return (True, f"поднят в премиум ({price}\u20bd)")
+
+        try:
+            return await loop.run_in_executor(None, _promote)
+        except Exception as e:
+            log.exception("Playerok: не удалось поднять лот %s", item_id)
+            return (False, str(e))
+
     async def confirm_deal(self, deal_id: str, method_name: str = "") -> bool:
         """Подтверждает выполнение сделки продавцом.
 

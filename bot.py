@@ -568,6 +568,62 @@ async def cmd_delacc(msg: Message, command: CommandObject):
         await msg.answer(f"✅ Аккаунт #{arg} удалён.")
 
 
+@dp.message(Command("autopromote"))
+async def cmd_autopromote(msg: Message, command: CommandObject):
+    """Вкл/выкл автоподнятие лота в премиум после продажи."""
+    if not is_admin(msg.from_user.id):
+        return
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "вкл", "1", "true"):
+        cfg.auto_promote = True
+        await msg.answer(
+            "✅ Автоподнятие в премиум <b>включено</b>.\n"
+            f"Лимит: {cfg.promote_daily_limit or '∞'} поднятий в сутки.\n\n"
+            "⚠️ Каждое поднятие тратит деньги с баланса Playerok. Следи за "
+            "уведомлениями и балансом. Отключить: /autopromote off"
+        )
+    elif arg in ("off", "выкл", "0", "false"):
+        cfg.auto_promote = False
+        await msg.answer("⛔️ Автоподнятие <b>выключено</b>.")
+    else:
+        state = "включено ✅" if cfg.auto_promote else "выключено ⛔️"
+        used = _promote_counter["count"] if _promote_counter["day"] else 0
+        await msg.answer(
+            f"Автоподнятие в премиум: <b>{state}</b>\n"
+            f"Лимит в сутки: {cfg.promote_daily_limit or '∞'}\n"
+            f"Поднято сегодня: {used}\n\n"
+            "Включить: <code>/autopromote on</code>\n"
+            "Выключить: <code>/autopromote off</code>\n"
+            "Проверить (без траты): /testpromote &lt;товар&gt;"
+        )
+
+
+@dp.message(Command("testpromote"))
+async def cmd_testpromote(msg: Message, command: CommandObject):
+    """Проверяет, находит ли бот лот и уровни приоритета — без списания денег."""
+    if not is_admin(msg.from_user.id):
+        return
+    if market is None:
+        await msg.answer("Playerok не подключён.")
+        return
+    product = (command.args or "").strip()
+    if not product:
+        await msg.answer("Укажи товар: <code>/testpromote VR Игры...</code>")
+        return
+    item_id = await market.find_item_id(product)
+    if item_id is None:
+        await msg.answer(
+            f"❌ Лот <b>{html.escape(product)}</b> не найден среди твоих активных. "
+            f"Проверь точное название или что лот сейчас на витрине."
+        )
+        return
+    await msg.answer(
+        f"✅ Лот найден: <code>{html.escape(str(item_id))}</code>\n"
+        f"При продаже бот попробует поднять его в премиум. "
+        f"Реальное поднание (с тратой) произойдёт только на живой продаже."
+    )
+
+
 @dp.message(Command("autoconfirm"))
 async def cmd_autoconfirm(msg: Message, command: CommandObject):
     """Вкл/выкл автоподтверждение сделок без передеплоя."""
@@ -1177,6 +1233,52 @@ def _access_text(acc: Account, deal: Deal, mafile: MaFile, shared: bool) -> str:
 # переходит по ссылке в Telegram-бота, а токен говорит боту, что отдать.
 _file_tokens: dict[str, dict] = {}
 
+# Счётчик поднятий в премиум за сутки — предохранитель от лишних трат.
+_promote_counter = {"day": "", "count": 0}
+
+
+async def _auto_promote(product: str) -> None:
+    """Поднимает лот в премиум после продажи, с дневным лимитом.
+
+    Лимит — защита от бага/всплеска, который иначе сожжёт баланс Playerok.
+    Списывает реальные деньги, поэтому каждый шаг логируется и отчитывается
+    тебе в Telegram.
+    """
+    if not cfg.auto_promote or market is None:
+        return
+    import datetime
+    today = datetime.date.today().isoformat()
+    if _promote_counter["day"] != today:
+        _promote_counter["day"] = today
+        _promote_counter["count"] = 0
+    if cfg.promote_daily_limit and _promote_counter["count"] >= cfg.promote_daily_limit:
+        await notify_admins(
+            f"⛔️ Лимит поднятий на сегодня исчерпан "
+            f"({cfg.promote_daily_limit}). Лот <b>{html.escape(product)}</b> "
+            f"НЕ поднят. Поднять вручную или увеличить PROMOTE_DAILY_LIMIT."
+        )
+        return
+
+    item_id = await market.find_item_id(product)
+    if item_id is None:
+        await notify_admins(
+            f"⚠️ Не нашёл лот <b>{html.escape(product)}</b> для поднятия. "
+            f"Возможно, он ещё не перевыставлен площадкой."
+        )
+        return
+    ok, info = await market.promote_item(item_id)
+    if ok:
+        _promote_counter["count"] += 1
+        await notify_admins(
+            f"⬆️ Лот <b>{html.escape(product)}</b> {info}. "
+            f"Поднятий сегодня: {_promote_counter['count']}"
+            + (f"/{cfg.promote_daily_limit}" if cfg.promote_daily_limit else "")
+        )
+    else:
+        await notify_admins(
+            f"⚠️ Не удалось поднять <b>{html.escape(product)}</b>: {html.escape(info)}"
+        )
+
 
 async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str) -> None:
     # Автоподтверждение — только после успешной выдачи (ok=True),
@@ -1192,6 +1294,9 @@ async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str)
         f"Покупатель: {html.escape(order.buyer or '—')}\n"
         f"Статус: {status}{confirm_line}"
     )
+    # Автоподнятие в премиум — только если выдача прошла.
+    if ok:
+        await _auto_promote(product)
 
 
 async def _deliver_digital(order: "Order", product: str, digital: dict) -> None:
@@ -1340,6 +1445,9 @@ async def handle_order(order: Order) -> None:
         f"{kind}{slot_info} | всего сдавался: {acc.rents_count}\n"
         f"Покупатель: {html.escape(order.buyer or '—')}{confirm_line}"
     )
+    # Поднятие в премиум — только при продаже навсегда (аренда лот не убирает).
+    if not deal.is_rent:
+        await _auto_promote(product)
 
 
 # ─────────────────────────── чат сделки ───────────────────────────

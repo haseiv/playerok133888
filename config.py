@@ -41,6 +41,15 @@ class Config:
     confirm_method: str = os.getenv("CONFIRM_METHOD", "")
     bot_username: str = os.getenv("BOT_USERNAME", "")
 
+    # Автоподнятие лота в премиум после продажи. ВЫКЛ по умолчанию: тратит
+    # деньги с баланса Playerok, ошибка дороже удобства.
+    auto_promote: bool = os.getenv("AUTO_PROMOTE", "false").lower() in (
+        "1", "true", "yes", "да"
+    )
+    # Предохранитель: максимум поднятий в сутки. Защищает от бага/всплеска,
+    # который иначе сожжёт баланс. 0 = без лимита (не рекомендуется).
+    promote_daily_limit: int = int(os.getenv("PROMOTE_DAILY_LIMIT", "20") or 20)
+
     def validate(self) -> None:
         if not self.bot_token:
             raise RuntimeError("BOT_TOKEN не задан в .env")

@@ -1288,7 +1288,14 @@ async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str)
         confirmed = await market.confirm_deal(order.id, cfg.confirm_method)
         confirm_line = ("\n✅ Сделка подтверждена" if confirmed
                         else "\n⚠️ Подтвердите вручную на Playerok")
-    status = "✅ выдано" if ok else "❌ НЕ отправлено — выдайте вручную"
+    if ok:
+        status = "✅ выдано"
+    else:
+        status = "❌ НЕ отправлено — в очереди повторной выдачи"
+        await storage.queue_failed_delivery(
+            order.id, order.item_id, order.item_name,
+            order.chat_id, order.buyer,
+        )
     await notify_admins(
         f"🛒 Продан цифровой товар <b>{html.escape(product)}</b> ({what})\n"
         f"Покупатель: {html.escape(order.buyer or '—')}\n"
@@ -1417,10 +1424,15 @@ async def handle_order(order: Order) -> None:
         # Отправка не удалась — аккаунт занимать нельзя, иначе он повиснет
         # арендованным без арендатора. Откатываем.
         await storage.finish_deal(deal.order_id, "free")
+        # Ставим в очередь повторной выдачи — фоновый цикл попробует снова.
+        await storage.queue_failed_delivery(
+            order.id, order.item_id, order.item_name,
+            order.chat_id, order.buyer,
+        )
         await notify_admins(
             f"❌ Заказ {order.id}: не удалось отправить данные в чат.\n"
-            f"Аккаунт #{acc.id} возвращён на склад. Выдайте вручную: "
-            f"<code>/issue {product}</code>"
+            f"Аккаунт #{acc.id} возвращён на склад.\n"
+            f"🔄 Заказ поставлен в очередь повторной выдачи."
         )
         return
 
@@ -1522,6 +1534,73 @@ async def expire_rents_loop() -> None:
         await asyncio.sleep(60)
 
 
+# ───────────────── повторная выдача невыданных заказов ─────────────────
+
+MAX_DELIVERY_ATTEMPTS = 5
+
+
+async def retry_failed_deliveries_loop() -> None:
+    """Раз в 30 секунд проверяет очередь невыданных заказов.
+
+    Для каждого «созревшего» заказа вызывает handle_order повторно.
+    Если заказ был обработан ранее (deal_exists), он удаляется из очереди.
+    После MAX_DELIVERY_ATTEMPTS безуспешных попыток заказ удаляется,
+    а админу приходит уведомление о ручной выдаче.
+    """
+    await asyncio.sleep(10)  # дать боту стартовать
+    while True:
+        try:
+            due = await storage.due_failed_deliveries()
+            for entry in due:
+                order_id = entry["order_id"]
+
+                # Если заказ уже выдан (например, вручную) — убираем.
+                if await storage.deal_exists(order_id):
+                    await storage.drop_failed_delivery(order_id)
+                    continue
+
+                if entry["attempts"] >= MAX_DELIVERY_ATTEMPTS:
+                    await storage.drop_failed_delivery(order_id)
+                    await notify_admins(
+                        f"⛔️ Заказ {order_id}: {MAX_DELIVERY_ATTEMPTS} попыток "
+                        f"повторной выдачи не увенчались успехом.\n"
+                        f"Товар: <b>{html.escape(entry['item_name'])}</b>\n"
+                        f"Покупатель: {html.escape(entry['buyer'] or '—')}\n"
+                        f"Выдайте вручную через Playerok."
+                    )
+                    continue
+
+                log.info(
+                    "Повторная выдача: заказ %s, попытка %d/%d",
+                    order_id, entry["attempts"] + 1, MAX_DELIVERY_ATTEMPTS,
+                )
+                order = Order(
+                    id=order_id,
+                    item_id=entry["item_id"],
+                    item_name=entry["item_name"],
+                    chat_id=entry["chat_id"],
+                    buyer=entry["buyer"],
+                )
+                try:
+                    await handle_order(order)
+                    # handle_order сам решит, что делать: если deal_exists —
+                    # пропустит, если выдаст — ок. Если снова провалится —
+                    # queue_failed_delivery вставит INSERT OR IGNORE (уже есть).
+                    # Проверяем: если после handle_order сделка появилась —
+                    # значит выдача прошла.
+                    if await storage.deal_exists(order_id):
+                        await storage.drop_failed_delivery(order_id)
+                        log.info("Повторная выдача заказа %s: успешно", order_id)
+                    else:
+                        await storage.bump_failed_delivery(order_id)
+                except Exception:
+                    log.exception("Ошибка повторной выдачи заказа %s", order_id)
+                    await storage.bump_failed_delivery(order_id)
+        except Exception:
+            log.exception("Ошибка в цикле повторной выдачи")
+        await asyncio.sleep(30)
+
+
 # ─────────────────────────── запуск ───────────────────────────
 
 market: PlayerokMarket | None = None
@@ -1558,6 +1637,7 @@ async def main() -> None:
         log.info("PLAYEROK_COOKIES не заданы — ручной режим (/issue)")
 
     asyncio.create_task(expire_rents_loop())
+    asyncio.create_task(retry_failed_deliveries_loop())
 
     try:
         await dp.start_polling(bot)

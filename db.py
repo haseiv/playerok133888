@@ -125,6 +125,20 @@ CREATE TABLE IF NOT EXISTS events (
     payload    TEXT,
     created_at INTEGER NOT NULL
 );
+
+-- Очередь невыданных заказов: сюда попадают сделки, в которых
+-- send_message не смог отправить товар покупателю. Фоновый цикл
+-- периодически пробует выдать повторно.
+CREATE TABLE IF NOT EXISTS failed_deliveries (
+    order_id   TEXT PRIMARY KEY,
+    item_id    TEXT NOT NULL,
+    item_name  TEXT NOT NULL,
+    chat_id    TEXT,
+    buyer      TEXT,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    next_retry INTEGER NOT NULL,           -- unix-время следующей попытки
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -728,6 +742,79 @@ class Storage:
         await self.db.execute("DELETE FROM codes WHERE product=?", (product,))
         await self.db.commit()
         return cur.rowcount > 0
+
+    # ---------- очередь невыданных заказов ----------
+
+    async def queue_failed_delivery(self, order_id: str, item_id: str,
+                                    item_name: str, chat_id: str | None,
+                                    buyer: str | None) -> None:
+        """Помещает заказ в очередь повторной выдачи.
+
+        Первая повторная попытка — через 30 секунд. Если запись уже есть
+        (повторный вызов), ничего не делаем (INSERT OR IGNORE).
+        """
+        now = int(time.time())
+        await self.db.execute(
+            "INSERT OR IGNORE INTO failed_deliveries "
+            "(order_id, item_id, item_name, chat_id, buyer, attempts, "
+            "next_retry, created_at) VALUES (?,?,?,?,?,0,?,?)",
+            (order_id, item_id, item_name, chat_id, buyer, now + 30, now),
+        )
+        await self.db.commit()
+
+    async def due_failed_deliveries(self) -> list[dict]:
+        """Возвращает заказы, у которых подошло время повторной попытки."""
+        now = int(time.time())
+        cur = await self.db.execute(
+            "SELECT * FROM failed_deliveries WHERE next_retry <= ? "
+            "ORDER BY next_retry", (now,),
+        )
+        rows = await cur.fetchall()
+        return [
+            {
+                "order_id": r["order_id"],
+                "item_id": r["item_id"],
+                "item_name": r["item_name"],
+                "chat_id": r["chat_id"],
+                "buyer": r["buyer"],
+                "attempts": r["attempts"],
+            }
+            for r in rows
+        ]
+
+    async def bump_failed_delivery(self, order_id: str) -> None:
+        """Увеличивает счётчик попыток и откладывает следующую.
+
+        Задержка растёт экспоненциально: 30 с, 60 с, 2 мин, 4 мин, 8 мин.
+        Максимум 5 попыток — потом заказ убирается (drop_failed_delivery).
+        """
+        now = int(time.time())
+        cur = await self.db.execute(
+            "SELECT attempts FROM failed_deliveries WHERE order_id=?",
+            (order_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return
+        new_attempts = row["attempts"] + 1
+        delay = min(30 * (2 ** new_attempts), 600)  # макс 10 минут
+        await self.db.execute(
+            "UPDATE failed_deliveries SET attempts=?, next_retry=? "
+            "WHERE order_id=?",
+            (new_attempts, now + delay, order_id),
+        )
+        await self.db.commit()
+
+    async def drop_failed_delivery(self, order_id: str) -> None:
+        """Удаляет заказ из очереди (успех или превышен лимит попыток)."""
+        await self.db.execute(
+            "DELETE FROM failed_deliveries WHERE order_id=?", (order_id,)
+        )
+        await self.db.commit()
+
+    async def failed_delivery_count(self) -> int:
+        cur = await self.db.execute("SELECT COUNT(*) c FROM failed_deliveries")
+        return (await cur.fetchone())["c"]
 
 
 storage = Storage()

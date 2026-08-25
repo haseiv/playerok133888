@@ -163,17 +163,30 @@ class PlayerokMarket:
 
     # ---------- отправка сообщений ----------
 
-    async def send_message(self, chat_id: str, text: str) -> bool:
-        """Асинхронная обёртка: сама библиотека синхронная, поэтому в тред-пул."""
+    async def send_message(self, chat_id: str, text: str,
+                           retries: int = 3) -> bool:
+        """Асинхронная обёртка с повторными попытками.
+
+        Сама библиотека синхронная, поэтому вызов идёт в тред-пул.
+        При ошибке делаем до ``retries`` попыток с экспоненциальным
+        back-off (1 с, 2 с, 4 с), чтобы пережить кратковременные сбои
+        сети и моменты, когда Playerok ещё не успел создать чат.
+        """
         loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(
-                None, lambda: self.account.send_message(chat_id=chat_id, text=text)
-            )
-            return True
-        except Exception:
-            log.exception("Playerok: не удалось отправить сообщение в чат %s", chat_id)
-            return False
+        for attempt in range(retries):
+            try:
+                await loop.run_in_executor(
+                    None, lambda: self.account.send_message(chat_id=chat_id, text=text)
+                )
+                return True
+            except Exception:
+                log.exception(
+                    "Playerok: не удалось отправить сообщение в чат %s "
+                    "(попытка %d/%d)", chat_id, attempt + 1, retries,
+                )
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        return False
 
     async def find_item_id(self, product_name: str) -> str | None:
         """Ищет id своего лота по названию (для перевыкладки/поднятия)."""

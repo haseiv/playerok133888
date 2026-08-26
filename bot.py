@@ -649,13 +649,13 @@ async def cmd_testrelist(msg: Message, command: CommandObject):
     if _is_item_uuid(arg):
         item_id = arg
     else:
-        item_id = await market.find_item_id(arg)
+        item_id = await market.find_item_id(arg, sold_ok=True)
         if item_id is None:
             await msg.answer(
-                "❌ Среди активных лотов не нашёл "
-                f"<b>{html.escape(arg)}</b>.\n"
-                "Проверь, что лот сейчас на витрине, или пришли UUID лота "
-                "(из уведомления о продаже)."
+                "❌ Не нашёл лот <b>"
+                f"{html.escape(arg)}</b> ни среди активных, ни среди проданных.\n"
+                "Открой лот на Playerok и пришли UUID из ссылки "
+                "(playerok.com/products/<code>ВОТ-ЭТО</code>)."
             )
             return
     await msg.answer("Пробую перевыставить… это может занять до минуты.")

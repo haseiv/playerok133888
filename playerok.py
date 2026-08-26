@@ -223,13 +223,10 @@ class PlayerokMarket:
             if not after:
                 return
 
-    def _match_item_id(self, query: str) -> str | None:
-        """Точное имя, затем сравнение без эмодзи/пробелов (normalize_title)."""
-        if not query:
-            return None
+    def _match_in_statuses(self, query: str, statuses) -> str | None:
         target = normalize_title(query)
         fuzzy = None
-        for it in self._iter_my_items():
+        for it in self._iter_my_items(statuses=statuses):
             name = getattr(it, "name", "") or ""
             iid = getattr(it, "id", None)
             if name == query:
@@ -238,16 +235,50 @@ class PlayerokMarket:
                 fuzzy = iid
         return fuzzy
 
-    async def find_item_id(self, product_name: str) -> str | None:
-        """Ищет id своего активного лота по названию (для перевыкладки/поднятия)."""
+    def _match_item_id(self, query: str, sold_ok: bool = False) -> str | None:
+        """Сначала активные лоты, при sold_ok — ещё проданные/черновики."""
+        from playerokapi.enums import ItemStatuses
+
+        if not query:
+            return None
+        found = self._match_in_statuses(query, [ItemStatuses.APPROVED])
+        if found or not sold_ok:
+            return found
+        return self._match_in_statuses(
+            query,
+            [ItemStatuses.SOLD, ItemStatuses.DRAFT, ItemStatuses.EXPIRED],
+        )
+
+    async def find_item_id(self, product_name: str, sold_ok: bool = False) -> str | None:
+        """Ищет id своего лота по названию (для перевыкладки/поднятия)."""
         loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(
-                None, lambda: self._match_item_id(product_name),
+                None, lambda: self._match_item_id(product_name, sold_ok),
             )
         except Exception:
             log.exception("Playerok: не удалось найти лот %s", product_name)
             return None
+
+    def _pick_free_priority(self, item_id: str, price: int):
+        statuses = self.account.get_item_priority_statuses(item_id, int(price))
+        lst = getattr(statuses, "priority_statuses", None) or statuses
+        for st in lst:
+            try:
+                st_price = int(getattr(st, "price", 1) or 1)
+            except (TypeError, ValueError):
+                st_price = 1
+            label = (getattr(st, "name", "") or "").lower()
+            if st_price == 0 or "обычн" in label or "default" in label:
+                return st
+        return None
+
+    def _publish_free(self, item_id: str, price: int):
+        """То же действие, что кнопка «Выставить повторно» на странице лота."""
+        free = self._pick_free_priority(item_id, price)
+        if free is None:
+            return None
+        return self.account.publish_item(item_id, getattr(free, "id", None))
 
     def _download_attachment(self, url: str) -> bytes | None:
         try:
@@ -278,10 +309,8 @@ class PlayerokMarket:
         return out
 
     def _relist_sync(self, item_id: str, item_name: str = "") -> tuple[bool, str, str | None]:
-        """Клонирует проданный лот и публикует бесплатным приоритетом.
-
-        Возвращает (успех, текст, id нового или уже активного лота).
-        Не тратит баланс: берётся статус с ценой 0.
+        """Снова выставляет лот: сначала «Выставить повторно» у проданного,
+        если не вышло — клонирует карточку и публикует бесплатным приоритетом.
         """
         from playerokapi.enums import ItemStatuses
 
@@ -290,12 +319,12 @@ class PlayerokMarket:
             return (getattr(st, "name", None) or str(st or "")).upper()
 
         if not _is_item_uuid(item_id):
-            resolved = self._match_item_id(item_name or item_id)
+            resolved = self._match_item_id(item_name or item_id, sold_ok=True)
             if not resolved:
                 return (
                     False,
-                    "лот с таким названием не найден среди активных на витрине. "
-                    "Скопируй название один в один с Playerok или укажи ID лота.",
+                    "лот не найден ни среди активных, ни среди проданных. "
+                    "Открой лот на Playerok и пришли UUID из адресной строки.",
                     None,
                 )
             item_id = resolved
@@ -304,7 +333,7 @@ class PlayerokMarket:
         want = normalize_title(item_name) if item_name else ""
         for it in self._iter_my_items():
             if getattr(it, "id", None) == item_id and _status_name(it) == "APPROVED":
-                return (True, "лот остался в продаже (keep in sale)", item_id)
+                return (True, "лот уже на витрине", item_id)
             name = getattr(it, "name", "") or ""
             if item_name and (name == item_name or (want and normalize_title(name) == want)):
                 existing = getattr(it, "id", None)
@@ -313,10 +342,26 @@ class PlayerokMarket:
 
         src = self.account.get_item(id=item_id)
         if src is None:
-            return (False, "не удалось загрузить проданный лот", None)
+            return (False, "не удалось загрузить лот", None)
 
-        if _status_name(src) == "APPROVED" and getattr(src, "keep_in_sale", False):
-            return (True, "лот остался в продаже", item_id)
+        if _status_name(src) == "APPROVED":
+            return (True, "лот уже на витрине", item_id)
+
+        price = getattr(src, "raw_price", None) or getattr(src, "price", None)
+        st = _status_name(src)
+        # Кнопка «Выставить повторно» = publish_item на том же id.
+        if price is not None and st in ("SOLD", "DRAFT", "EXPIRED"):
+            try:
+                published = self._publish_free(item_id, int(price))
+                if published is not None:
+                    pub_id = getattr(published, "id", None) or item_id
+                    log.info("Playerok: лот %s выставлен повторно", pub_id)
+                    return (True, f"выставлен повторно ({price}₽)", pub_id)
+            except Exception:
+                log.exception(
+                    "Playerok: publish_item не сработал для проданного %s, пробую клон",
+                    item_id,
+                )
 
         category = getattr(src, "category", None)
         obtaining = getattr(src, "obtaining_type", None)
@@ -356,23 +401,9 @@ class PlayerokMarket:
         if not new_id:
             return (False, "create_item не вернул id", None)
 
-        statuses = self.account.get_item_priority_statuses(new_id, int(price))
-        lst = getattr(statuses, "priority_statuses", None) or statuses
-        free = None
-        for st in lst:
-            try:
-                st_price = int(getattr(st, "price", 1) or 1)
-            except (TypeError, ValueError):
-                st_price = 1
-            label = (getattr(st, "name", "") or "").lower()
-            if st_price == 0 or "обычн" in label or "default" in label:
-                free = st
-                break
-        if free is None:
+        published = self._publish_free(new_id, int(price))
+        if published is None:
             return (False, f"черновик {new_id} создан, но бесплатный приоритет не найден — выставь вручную", new_id)
-
-        priority_id = getattr(free, "id", None)
-        published = self.account.publish_item(new_id, priority_id)
         pub_id = getattr(published, "id", None) or new_id
         return (True, f"выставлен заново ({price}₽)", pub_id)
 

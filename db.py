@@ -400,6 +400,24 @@ class Storage:
         await self.db.commit()
         return cur.rowcount > 0
 
+    async def has_stock_for_sale(self, product: str) -> bool:
+        """Есть ли ещё что продавать по этому товару после текущей сделки.
+
+        Цифровой текст/файл и общий аккаунт — безлимит. Коды — пока пул
+        не пуст. Steam-аккаунты — пока есть free или shared.
+        """
+        digital = await self.get_digital(product)
+        if digital is not None:
+            if digital["kind"] == "codes":
+                return await self.codes_left(product) > 0
+            return True
+        cur = await self.db.execute(
+            "SELECT 1 FROM accounts WHERE product=? AND status IN ('free','shared') "
+            "LIMIT 1",
+            (product,),
+        )
+        return await cur.fetchone() is not None
+
     async def resolve_product(self, item_id: str, item_name: str) -> str | None:
         """Находит товар для оплаченного лота.
 

@@ -41,6 +41,12 @@ class Config:
     confirm_method: str = os.getenv("CONFIRM_METHOD", "")
     bot_username: str = os.getenv("BOT_USERNAME", "")
 
+    # После продажи лот на площадке снимается. ВКЛ по умолчанию: бот клонирует
+    # проданный лот (название, цена, описание, фото) и выставляет заново
+    # бесплатным приоритетом. Не тратит баланс. Отключить: AUTO_RELIST=false.
+    auto_relist: bool = os.getenv("AUTO_RELIST", "true").lower() in (
+        "1", "true", "yes", "да"
+    )
     # Автоподнятие лота в премиум после продажи. ВЫКЛ по умолчанию: тратит
     # деньги с баланса Playerok, ошибка дороже удобства.
     auto_promote: bool = os.getenv("AUTO_PROMOTE", "false").lower() in (

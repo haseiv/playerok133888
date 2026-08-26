@@ -188,14 +188,32 @@ class PlayerokMarket:
                     await asyncio.sleep(2 ** attempt)
         return False
 
+    def _iter_my_items(self, statuses=None, max_pages: int = 20):
+        """Страницы своих лотов. По умолчанию только активные (APPROVED)."""
+        from playerokapi.enums import ItemStatuses
+
+        after = None
+        wanted = statuses if statuses is not None else [ItemStatuses.APPROVED]
+        for _ in range(max_pages):
+            page = self.account.get_my_items(
+                statuses=wanted, count=24, after_cursor=after,
+            )
+            items = getattr(page, "items", None) or []
+            for it in items:
+                yield it
+            info = getattr(page, "page_info", None)
+            if not info or not getattr(info, "has_next_page", False):
+                return
+            after = getattr(info, "end_cursor", None)
+            if not after:
+                return
+
     async def find_item_id(self, product_name: str) -> str | None:
-        """Ищет id своего лота по названию (для перевыкладки/поднятия)."""
+        """Ищет id своего активного лота по названию (для перевыкладки/поднятия)."""
         loop = asyncio.get_running_loop()
 
         def _find():
-            items = self.account.get_my_items()
-            lst = getattr(items, "items", items)
-            for it in lst:
+            for it in self._iter_my_items():
                 if getattr(it, "name", "") == product_name:
                     return getattr(it, "id", None)
             return None
@@ -205,6 +223,131 @@ class PlayerokMarket:
         except Exception:
             log.exception("Playerok: не удалось найти лот %s", product_name)
             return None
+
+    def _download_attachment(self, url: str) -> bytes | None:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": self.user_agent or "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except Exception:
+            log.exception("Playerok: не скачалось фото лота %s", url)
+            return None
+
+    def _item_data_fields(self, src) -> list:
+        """Только ITEM_DATA: OBTAINING_DATA заполняет покупатель, их не копируем."""
+        from playerokapi.enums import GameCategoryDataFieldTypes
+
+        out = []
+        for field in getattr(src, "data_fields", None) or []:
+            ftype = getattr(field, "type", None)
+            name = getattr(ftype, "name", None) or str(ftype or "")
+            if ftype is GameCategoryDataFieldTypes.OBTAINING_DATA:
+                continue
+            if "OBTAINING" in str(name).upper():
+                continue
+            if getattr(field, "id", None) is None:
+                continue
+            out.append(field)
+        return out
+
+    def _relist_sync(self, item_id: str, item_name: str = "") -> tuple[bool, str, str | None]:
+        """Клонирует проданный лот и публикует бесплатным приоритетом.
+
+        Возвращает (успех, текст, id нового или уже активного лота).
+        Не тратит баланс: берётся статус с ценой 0.
+        """
+        from playerokapi.enums import ItemStatuses
+
+        def _status_name(obj) -> str:
+            st = getattr(obj, "status", None)
+            return (getattr(st, "name", None) or str(st or "")).upper()
+
+        # Уже висит активный лот с тем же названием — второй не создаём.
+        for it in self._iter_my_items():
+            if getattr(it, "id", None) == item_id and _status_name(it) == "APPROVED":
+                return (True, "лот остался в продаже (keep in sale)", item_id)
+            if item_name and getattr(it, "name", "") == item_name:
+                existing = getattr(it, "id", None)
+                if existing and existing != item_id:
+                    return (True, "активный лот с таким названием уже есть", existing)
+
+        src = self.account.get_item(id=item_id)
+        if src is None:
+            return (False, "не удалось загрузить проданный лот", None)
+
+        if _status_name(src) == "APPROVED" and getattr(src, "keep_in_sale", False):
+            return (True, "лот остался в продаже", item_id)
+
+        category = getattr(src, "category", None)
+        obtaining = getattr(src, "obtaining_type", None)
+        cat_id = getattr(category, "id", None)
+        obt_id = getattr(obtaining, "id", None)
+        name = getattr(src, "name", None) or item_name
+        price = getattr(src, "raw_price", None) or getattr(src, "price", None)
+        description = getattr(src, "description", None) or ""
+        attributes = getattr(src, "attributes", None) or {}
+        if not isinstance(attributes, dict):
+            attributes = {}
+
+        if not cat_id or not obt_id or not name or price is None:
+            return (False, "у лота нет категории, способа получения или цены", None)
+
+        attachments: list[bytes] = []
+        for att in getattr(src, "attachments", None) or []:
+            url = getattr(att, "url", None)
+            if not url:
+                continue
+            raw = self._download_attachment(url)
+            if raw:
+                attachments.append(raw)
+
+        data_fields = self._item_data_fields(src)
+        draft = self.account.create_item(
+            game_category_id=cat_id,
+            obtaining_type_id=obt_id,
+            name=name,
+            price=int(price),
+            description=description,
+            options=attributes,
+            data_fields=data_fields,
+            attachments=attachments,
+        )
+        new_id = getattr(draft, "id", None)
+        if not new_id:
+            return (False, "create_item не вернул id", None)
+
+        statuses = self.account.get_item_priority_statuses(new_id, int(price))
+        lst = getattr(statuses, "priority_statuses", None) or statuses
+        free = None
+        for st in lst:
+            try:
+                st_price = int(getattr(st, "price", 1) or 1)
+            except (TypeError, ValueError):
+                st_price = 1
+            label = (getattr(st, "name", "") or "").lower()
+            if st_price == 0 or "обычн" in label or "default" in label:
+                free = st
+                break
+        if free is None:
+            return (False, f"черновик {new_id} создан, но бесплатный приоритет не найден — выставь вручную", new_id)
+
+        priority_id = getattr(free, "id", None)
+        published = self.account.publish_item(new_id, priority_id)
+        pub_id = getattr(published, "id", None) or new_id
+        return (True, f"выставлен заново ({price}₽)", pub_id)
+
+    async def relist_item(self, item_id: str, item_name: str = "") -> tuple[bool, str, str | None]:
+        """Асинхронная обёртка: клонирует лот и выставляет на витрину."""
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                None, lambda: self._relist_sync(item_id, item_name),
+            )
+        except Exception as e:
+            log.exception("Playerok: не удалось перевыставить лот %s", item_id)
+            return (False, str(e), None)
 
     async def promote_item(self, item_id: str) -> tuple[bool, str]:
         """Поднимает лот в премиум (платно). Возвращает (успех, сообщение).

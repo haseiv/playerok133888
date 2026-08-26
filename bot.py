@@ -568,6 +568,65 @@ async def cmd_delacc(msg: Message, command: CommandObject):
         await msg.answer(f"✅ Аккаунт #{arg} удалён.")
 
 
+@dp.message(Command("autorelist"))
+async def cmd_autorelist(msg: Message, command: CommandObject):
+    """Вкл/выкл автоматическое перевыставление лота после продажи."""
+    if not is_admin(msg.from_user.id):
+        return
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "вкл", "1", "true"):
+        cfg.auto_relist = True
+        await msg.answer(
+            "✅ Автоперевыставление <b>включено</b>.\n"
+            "После продажи бот клонирует лот (название, цена, описание, фото) "
+            "и выставляет его заново бесплатным приоритетом.\n\n"
+            "Отключить: /autorelist off"
+        )
+    elif arg in ("off", "выкл", "0", "false"):
+        cfg.auto_relist = False
+        await msg.answer("⛔️ Автоперевыставление <b>выключено</b>.")
+    else:
+        state = "включено ✅" if cfg.auto_relist else "выключено ⛔️"
+        await msg.answer(
+            f"Автоперевыставление лота после продажи: <b>{state}</b>\n\n"
+            "Включить: <code>/autorelist on</code>\n"
+            "Выключить: <code>/autorelist off</code>\n"
+            "Проверить на живом лоте: /testrelist &lt;товар или ID&gt;"
+        )
+
+
+@dp.message(Command("testrelist"))
+async def cmd_testrelist(msg: Message, command: CommandObject):
+    """Перевыставляет лот сейчас — для проверки, без ожидания продажи."""
+    if not is_admin(msg.from_user.id):
+        return
+    if market is None:
+        await msg.answer("Playerok не подключён.")
+        return
+    arg = (command.args or "").strip()
+    if not arg:
+        await msg.answer(
+            "Укажи ID лота или точное название:\n"
+            "<code>/testrelist 019abc...</code>\n"
+            "<code>/testrelist VR Игры...</code>"
+        )
+        return
+    item_id = arg
+    item_name = arg
+    # Если это не похоже на UUID/id — ищем среди активных по названию.
+    if " " in arg or len(arg) < 8:
+        found = await market.find_item_id(arg)
+        if found:
+            item_id = found
+    await msg.answer("Пробую перевыставить… это может занять до минуты.")
+    ok, info, new_id = await market.relist_item(item_id, item_name)
+    extra = f"\nНовый ID: <code>{html.escape(str(new_id))}</code>" if new_id else ""
+    if ok:
+        await msg.answer(f"✅ {html.escape(info)}{extra}")
+    else:
+        await msg.answer(f"❌ {html.escape(info)}{extra}")
+
+
 @dp.message(Command("autopromote"))
 async def cmd_autopromote(msg: Message, command: CommandObject):
     """Вкл/выкл автоподнятие лота в премиум после продажи."""
@@ -859,7 +918,8 @@ def _panel_text() -> str:
         "Команды тоже работают: /add, /rent, /link, /issue.\n\n"
         "<b>Товары:</b>\n"
         "/add — Steam-аккаунт · /addtext — гайд · /addfile — файл · /addcodes — ключи\n"
-        "/digital — список цифровых товаров"
+        "/digital — список цифровых товаров\n"
+        "/autorelist — заново выставлять лот после продажи"
     )
 
 
@@ -1237,7 +1297,53 @@ _file_tokens: dict[str, dict] = {}
 _promote_counter = {"day": "", "count": 0}
 
 
-async def _auto_promote(product: str) -> None:
+async def _auto_relist(order: "Order", product: str) -> None:
+    """Клонирует проданный лот и выставляет его снова, если на складе ещё есть товар."""
+    if not cfg.auto_relist or market is None:
+        return
+    if not await storage.has_stock_for_sale(product):
+        await notify_admins(
+            f"ℹ️ Лот <b>{html.escape(product)}</b> не перевыставлен: "
+            f"на складе больше нет свободного товара."
+        )
+        return
+    ok, info, new_id = await market.relist_item(order.item_id, order.item_name)
+    if ok and new_id:
+        await storage.link_lot(str(new_id), product)
+        if order.item_name:
+            await storage.link_lot(order.item_name, product)
+        await notify_admins(
+            f"📌 Лот <b>{html.escape(product)}</b> {html.escape(info)}.\n"
+            f"ID: <code>{html.escape(str(new_id))}</code>"
+        )
+    elif ok:
+        await notify_admins(
+            f"📌 <b>{html.escape(product)}</b>: {html.escape(info)}"
+        )
+    else:
+        extra = (f"\nЧерновик: <code>{html.escape(str(new_id))}</code>"
+                 if new_id else "")
+        await notify_admins(
+            f"⚠️ Не удалось перевыставить <b>{html.escape(product)}</b>: "
+            f"{html.escape(info)}{extra}"
+        )
+
+
+async def _after_sale(order: "Order", product: str, *,
+                     delivered: bool, is_rent: bool) -> None:
+    """После продажи: перевыставить лот, затем (если нужно) поднять в премиум.
+
+    Аренда лот с витрины не снимает — её не трогаем.
+    """
+    if is_rent:
+        return
+    await _auto_relist(order, product)
+    if delivered:
+        await asyncio.sleep(2)
+        await _auto_promote(product, listing_name=order.item_name)
+
+
+async def _auto_promote(product: str, listing_name: str | None = None) -> None:
     """Поднимает лот в премиум после продажи, с дневным лимитом.
 
     Лимит — защита от бага/всплеска, который иначе сожжёт баланс Playerok.
@@ -1260,6 +1366,8 @@ async def _auto_promote(product: str) -> None:
         return
 
     item_id = await market.find_item_id(product)
+    if item_id is None and listing_name and listing_name != product:
+        item_id = await market.find_item_id(listing_name)
     if item_id is None:
         await notify_admins(
             f"⚠️ Не нашёл лот <b>{html.escape(product)}</b> для поднятия. "
@@ -1301,9 +1409,9 @@ async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str)
         f"Покупатель: {html.escape(order.buyer or '—')}\n"
         f"Статус: {status}{confirm_line}"
     )
-    # Автоподнятие в премиум — только если выдача прошла.
-    if ok:
-        await _auto_promote(product)
+    # Перевыставление лота — после любой продажи (даже если чат не ответил:
+    # на площадке лот уже снят). Поднятие в премиум — только после выдачи.
+    await _after_sale(order, product, delivered=ok, is_rent=False)
 
 
 async def _deliver_digital(order: "Order", product: str, digital: dict) -> None:
@@ -1388,6 +1496,10 @@ async def handle_order(order: Order) -> None:
             f"⚠️ Заказ {order.id} (<b>{html.escape(product)}</b>) без чата сделки. "
             f"Выдайте вручную: <code>/issue {product}</code>"
         )
+        digital = await storage.get_digital(product)
+        hours, _ = await storage.product_settings(product)
+        is_rent = digital is None and hours > 0
+        await _after_sale(order, product, delivered=False, is_rent=is_rent)
         return
 
     # Цифровой товар (текст / файл / коды) — проверяем до Steam-аккаунтов.
@@ -1434,6 +1546,7 @@ async def handle_order(order: Order) -> None:
             f"Аккаунт #{acc.id} возвращён на склад.\n"
             f"🔄 Заказ поставлен в очередь повторной выдачи."
         )
+        await _after_sale(order, product, delivered=False, is_rent=deal.is_rent)
         return
 
     kind = f"🕒 аренда {human_left(deal.seconds_left())}" if deal.is_rent else "💰 продажа"
@@ -1457,9 +1570,9 @@ async def handle_order(order: Order) -> None:
         f"{kind}{slot_info} | всего сдавался: {acc.rents_count}\n"
         f"Покупатель: {html.escape(order.buyer or '—')}{confirm_line}"
     )
-    # Поднятие в премиум — только при продаже навсегда (аренда лот не убирает).
-    if not deal.is_rent:
-        await _auto_promote(product)
+    # Перевыставление — продажа снимает лот с витрины. Аренда — нет.
+    # Поднятие в премиум — только при успешной продаже навсегда.
+    await _after_sale(order, product, delivered=True, is_rent=deal.is_rent)
 
 
 # ─────────────────────────── чат сделки ───────────────────────────

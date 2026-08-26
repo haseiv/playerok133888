@@ -568,7 +568,27 @@ async def cmd_delacc(msg: Message, command: CommandObject):
         await msg.answer(f"✅ Аккаунт #{arg} удалён.")
 
 
-@dp.message(Command("autorelist"))
+def _autorelist_status_text() -> str:
+    state = "включено ✅" if cfg.auto_relist else "выключено ⛔️"
+    return (
+        f"Автоперевыставление лота после продажи: <b>{state}</b>\n\n"
+        "После продажи бот клонирует лот (название, цена, описание, фото) "
+        "и выставляет его заново бесплатным приоритетом.\n\n"
+        "Включить: <code>/autorelist on</code>\n"
+        "Выключить: <code>/autorelist off</code>\n"
+        "Проверить: /testrelist &lt;товар или ID&gt;"
+    )
+
+
+def _autorelist_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Включить", callback_data="panel:relist_on"),
+         InlineKeyboardButton(text="⛔️ Выключить", callback_data="panel:relist_off")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="panel:menu")],
+    ])
+
+
+@dp.message(Command("autorelist", "авторелист"))
 async def cmd_autorelist(msg: Message, command: CommandObject):
     """Вкл/выкл автоматическое перевыставление лота после продажи."""
     if not is_admin(msg.from_user.id):
@@ -578,21 +598,35 @@ async def cmd_autorelist(msg: Message, command: CommandObject):
         cfg.auto_relist = True
         await msg.answer(
             "✅ Автоперевыставление <b>включено</b>.\n"
-            "После продажи бот клонирует лот (название, цена, описание, фото) "
-            "и выставляет его заново бесплатным приоритетом.\n\n"
-            "Отключить: /autorelist off"
+            "После продажи бот клонирует лот и выставляет его заново.\n\n"
+            "Отключить: /autorelist off",
+            reply_markup=_autorelist_kb(),
         )
     elif arg in ("off", "выкл", "0", "false"):
         cfg.auto_relist = False
-        await msg.answer("⛔️ Автоперевыставление <b>выключено</b>.")
-    else:
-        state = "включено ✅" if cfg.auto_relist else "выключено ⛔️"
         await msg.answer(
-            f"Автоперевыставление лота после продажи: <b>{state}</b>\n\n"
-            "Включить: <code>/autorelist on</code>\n"
-            "Выключить: <code>/autorelist off</code>\n"
-            "Проверить на живом лоте: /testrelist &lt;товар или ID&gt;"
+            "⛔️ Автоперевыставление <b>выключено</b>.",
+            reply_markup=_autorelist_kb(),
         )
+    else:
+        await msg.answer(_autorelist_status_text(), reply_markup=_autorelist_kb())
+
+
+def _looks_like_autorelist(text: str | None) -> bool:
+    """«авто релист» без слэша — Telegram не считает это командой."""
+    if not text:
+        return False
+    t = text.strip().lower().split("@", 1)[0].strip()
+    t = t.lstrip("/").replace("-", " ").replace("_", " ")
+    t = " ".join(t.split())
+    return t in {"autorelist", "auto relist", "авторелист", "авто релист"}
+
+
+@dp.message(F.text.func(_looks_like_autorelist))
+async def cmd_autorelist_plain(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.answer(_autorelist_status_text(), reply_markup=_autorelist_kb())
 
 
 @dp.message(Command("testrelist"))
@@ -907,6 +941,7 @@ def _panel_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🕒 Аренды", callback_data="panel:rents"),
          InlineKeyboardButton(text="🏷 Товары", callback_data="panel:products")],
         [InlineKeyboardButton(text="🔗 Связки лотов", callback_data="panel:links")],
+        [InlineKeyboardButton(text="📌 Авторелист", callback_data="panel:relist")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="panel:menu")],
     ])
 
@@ -919,7 +954,7 @@ def _panel_text() -> str:
         "<b>Товары:</b>\n"
         "/add — Steam-аккаунт · /addtext — гайд · /addfile — файл · /addcodes — ключи\n"
         "/digital — список цифровых товаров\n"
-        "/autorelist — заново выставлять лот после продажи"
+        "Кнопка «Авторелист» или /autorelist — заново выставлять лот после продажи"
     )
 
 
@@ -1182,6 +1217,17 @@ async def cb_panel(cb: CallbackQuery):
         await cb.message.edit_text(await _products_text(), reply_markup=_back_kb())
     elif action == "links":
         await cb.message.edit_text(await _links_text(), reply_markup=_back_kb())
+    elif action == "relist":
+        await cb.message.edit_text(_autorelist_status_text(),
+                                   reply_markup=_autorelist_kb())
+    elif action == "relist_on":
+        cfg.auto_relist = True
+        await cb.message.edit_text(_autorelist_status_text(),
+                                   reply_markup=_autorelist_kb())
+    elif action == "relist_off":
+        cfg.auto_relist = False
+        await cb.message.edit_text(_autorelist_status_text(),
+                                   reply_markup=_autorelist_kb())
     await cb.answer()
 
 

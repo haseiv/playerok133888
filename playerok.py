@@ -23,8 +23,11 @@ import shutil
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Awaitable, Callable
+
+from db import normalize_title
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +35,18 @@ log = logging.getLogger(__name__)
 ARCHIVE_URL = (
     "https://github.com/alleexxeeyy/PlayerokAPI/archive/refs/heads/main.zip"
 )
+
+
+def _is_item_uuid(value: str) -> bool:
+    """Playerok принимает в get_item только UUID, не название лота."""
+    s = (value or "").strip()
+    if not s or any(c.isspace() for c in s):
+        return False
+    try:
+        uuid.UUID(s)
+        return True
+    except ValueError:
+        return False
 
 
 def ensure_playerokapi() -> None:
@@ -208,18 +223,28 @@ class PlayerokMarket:
             if not after:
                 return
 
+    def _match_item_id(self, query: str) -> str | None:
+        """Точное имя, затем сравнение без эмодзи/пробелов (normalize_title)."""
+        if not query:
+            return None
+        target = normalize_title(query)
+        fuzzy = None
+        for it in self._iter_my_items():
+            name = getattr(it, "name", "") or ""
+            iid = getattr(it, "id", None)
+            if name == query:
+                return iid
+            if target and fuzzy is None and normalize_title(name) == target:
+                fuzzy = iid
+        return fuzzy
+
     async def find_item_id(self, product_name: str) -> str | None:
         """Ищет id своего активного лота по названию (для перевыкладки/поднятия)."""
         loop = asyncio.get_running_loop()
-
-        def _find():
-            for it in self._iter_my_items():
-                if getattr(it, "name", "") == product_name:
-                    return getattr(it, "id", None)
-            return None
-
         try:
-            return await loop.run_in_executor(None, _find)
+            return await loop.run_in_executor(
+                None, lambda: self._match_item_id(product_name),
+            )
         except Exception:
             log.exception("Playerok: не удалось найти лот %s", product_name)
             return None
@@ -264,11 +289,24 @@ class PlayerokMarket:
             st = getattr(obj, "status", None)
             return (getattr(st, "name", None) or str(st or "")).upper()
 
+        if not _is_item_uuid(item_id):
+            resolved = self._match_item_id(item_name or item_id)
+            if not resolved:
+                return (
+                    False,
+                    "лот с таким названием не найден среди активных на витрине. "
+                    "Скопируй название один в один с Playerok или укажи ID лота.",
+                    None,
+                )
+            item_id = resolved
+
         # Уже висит активный лот с тем же названием — второй не создаём.
+        want = normalize_title(item_name) if item_name else ""
         for it in self._iter_my_items():
             if getattr(it, "id", None) == item_id and _status_name(it) == "APPROVED":
                 return (True, "лот остался в продаже (keep in sale)", item_id)
-            if item_name and getattr(it, "name", "") == item_name:
+            name = getattr(it, "name", "") or ""
+            if item_name and (name == item_name or (want and normalize_title(name) == want)):
                 existing = getattr(it, "id", None)
                 if existing and existing != item_id:
                     return (True, "активный лот с таким названием уже есть", existing)

@@ -24,7 +24,7 @@ from aiogram.types import (
 
 from config import cfg
 from db import Account, Deal, storage
-from playerok import IncomingMessage, Order, PlayerokMarket
+from playerok import IncomingMessage, Order, PlayerokMarket, _is_item_uuid
 from steam_guard import MaFile, MaFileError, seconds_left
 
 logging.basicConfig(
@@ -640,18 +640,24 @@ async def cmd_testrelist(msg: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg:
         await msg.answer(
-            "Укажи ID лота или точное название:\n"
+            "Укажи ID лота или название с витрины:\n"
             "<code>/testrelist 019abc...</code>\n"
-            "<code>/testrelist VR Игры...</code>"
+            "<code>/testrelist VR Игры БЕЗЛИМИТ</code>"
         )
         return
-    item_id = arg
     item_name = arg
-    # Если это не похоже на UUID/id — ищем среди активных по названию.
-    if " " in arg or len(arg) < 8:
-        found = await market.find_item_id(arg)
-        if found:
-            item_id = found
+    if _is_item_uuid(arg):
+        item_id = arg
+    else:
+        item_id = await market.find_item_id(arg)
+        if item_id is None:
+            await msg.answer(
+                "❌ Среди активных лотов не нашёл "
+                f"<b>{html.escape(arg)}</b>.\n"
+                "Проверь, что лот сейчас на витрине, или пришли UUID лота "
+                "(из уведомления о продаже)."
+            )
+            return
     await msg.answer("Пробую перевыставить… это может занять до минуты.")
     ok, info, new_id = await market.relist_item(item_id, item_name)
     extra = f"\nНовый ID: <code>{html.escape(str(new_id))}</code>" if new_id else ""

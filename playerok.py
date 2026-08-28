@@ -37,6 +37,18 @@ ARCHIVE_URL = (
 )
 
 
+def _api_err(exc: BaseException) -> str:
+    """Короткий текст ошибки Playerok, без HTML и километровых дампов."""
+    msg = getattr(exc, "error_message", None) or str(exc) or type(exc).__name__
+    low = msg.lower()
+    if "just a moment" in low or "cloudflare" in low or "<html" in low:
+        return "антибот Playerok отклонил запрос — обнови PLAYEROK_COOKIES"
+    msg = " ".join(msg.replace("\r", " ").split())
+    if len(msg) > 350:
+        msg = msg[:350] + "…"
+    return msg
+
+
 def _is_item_uuid(value: str) -> bool:
     """Playerok принимает в get_item только UUID, не название лота."""
     s = (value or "").strip()
@@ -263,22 +275,76 @@ class PlayerokMarket:
     def _pick_free_priority(self, item_id: str, price: int):
         statuses = self.account.get_item_priority_statuses(item_id, int(price))
         lst = getattr(statuses, "priority_statuses", None) or statuses
+        if not isinstance(lst, (list, tuple)):
+            lst = [lst] if lst is not None else []
         for st in lst:
+            if st is None:
+                continue
             try:
                 st_price = int(getattr(st, "price", 1) or 1)
             except (TypeError, ValueError):
                 st_price = 1
             label = (getattr(st, "name", "") or "").lower()
-            if st_price == 0 or "обычн" in label or "default" in label:
+            ptype = getattr(st, "type", None)
+            type_name = getattr(ptype, "name", None) or str(ptype or "")
+            if (st_price == 0 or "обычн" in label or "default" in label
+                    or type_name.upper() == "DEFAULT"):
                 return st
-        return None
+        # Если бесплатного нет — берём самый дешёвый, иначе публиковать нечем.
+        priced = [st for st in lst if st is not None]
+        if not priced:
+            return None
+        return min(priced, key=lambda s: int(getattr(s, "price", 10**9) or 10**9))
 
-    def _publish_free(self, item_id: str, price: int):
-        """То же действие, что кнопка «Выставить повторно» на странице лота."""
+    def _publish_free(self, item_id: str, price: int, keep_in_sale: bool = True):
+        """То же, что кнопка «Выставить повторно»: publishItem + LOCAL."""
+        from playerokapi.misc import QUERIES
+        from playerokapi.parser import item as parse_item
+
         free = self._pick_free_priority(item_id, price)
         if free is None:
-            return None
-        return self.account.publish_item(item_id, getattr(free, "id", None))
+            raise RuntimeError(
+                f"не нашёл уровень приоритета для цены {price}₽"
+            )
+        pid = getattr(free, "id", None)
+        if not pid:
+            raise RuntimeError("у приоритета нет id")
+        query = QUERIES.get("publishItem")
+        if not query:
+            return self.account.publish_item(item_id, pid)
+
+        def _send(with_keep: bool):
+            inp = {
+                "transactionProviderId": "LOCAL",
+                "priorityStatuses": [str(pid)],
+                "itemId": item_id,
+                "transactionProviderData": {"paymentMethodId": None},
+            }
+            if with_keep:
+                inp["keepInSale"] = True
+            payload = {
+                "operationName": "publishItem",
+                "query": QUERIES.get("publishItem"),
+                "variables": {"input": inp},
+            }
+            r = self.account.request(
+                "post", f"{self.account.base_url}/graphql",
+                {"accept": "*/*"}, payload,
+            ).json()
+            raw = ((r or {}).get("data") or {}).get("publishItem")
+            if not raw:
+                raise RuntimeError("Playerok не вернул лот после публикации")
+            return parse_item(raw)
+
+        try:
+            return _send(keep_in_sale)
+        except Exception as e:
+            err = _api_err(e)
+            # Старая схема мутации без keepInSale / transactionProviderData.
+            if keep_in_sale or "keepinsale" in err.lower() or "transactionproviderdata" in err.lower():
+                log.warning("publishItem extra fields rejected: %s", err)
+                return self.account.publish_item(item_id, pid)
+            raise
 
     def _download_attachment(self, url: str) -> bytes | None:
         try:
@@ -347,65 +413,83 @@ class PlayerokMarket:
         if _status_name(src) == "APPROVED":
             return (True, "лот уже на витрине", item_id)
 
-        price = getattr(src, "raw_price", None) or getattr(src, "price", None)
+        price = getattr(src, "price", None) or getattr(src, "raw_price", None)
+        raw_price = getattr(src, "raw_price", None) or price
         st = _status_name(src)
-        # Кнопка «Выставить повторно» = publish_item на том же id.
-        if price is not None and st in ("SOLD", "DRAFT", "EXPIRED"):
-            try:
-                published = self._publish_free(item_id, int(price))
-                if published is not None:
+        prices_to_try = []
+        for p in (price, raw_price):
+            if p is not None:
+                ip = int(p)
+                if ip not in prices_to_try:
+                    prices_to_try.append(ip)
+
+        last_pub_err = None
+        if st in ("SOLD", "DRAFT", "EXPIRED") or getattr(src, "may_be_published", False):
+            for p in prices_to_try:
+                try:
+                    published = self._publish_free(item_id, p)
                     pub_id = getattr(published, "id", None) or item_id
                     log.info("Playerok: лот %s выставлен повторно", pub_id)
-                    return (True, f"выставлен повторно ({price}₽)", pub_id)
-            except Exception:
-                log.exception(
-                    "Playerok: publish_item не сработал для проданного %s, пробую клон",
-                    item_id,
-                )
+                    return (True, f"выставлен повторно ({p}₽)", pub_id)
+                except Exception as e:
+                    last_pub_err = _api_err(e)
+                    log.warning(
+                        "Playerok: publish_item %s цена %s: %s",
+                        item_id, p, last_pub_err,
+                    )
 
+        # Клон — запасной путь. Если нет категории, отдаём ошибку публикации.
         category = getattr(src, "category", None)
         obtaining = getattr(src, "obtaining_type", None)
         cat_id = getattr(category, "id", None)
         obt_id = getattr(obtaining, "id", None)
         name = getattr(src, "name", None) or item_name
-        price = getattr(src, "raw_price", None) or getattr(src, "price", None)
         description = getattr(src, "description", None) or ""
         attributes = getattr(src, "attributes", None) or {}
         if not isinstance(attributes, dict):
             attributes = {}
+        clone_price = prices_to_try[0] if prices_to_try else None
 
-        if not cat_id or not obt_id or not name or price is None:
-            return (False, "у лота нет категории, способа получения или цены", None)
+        if not cat_id or not obt_id or not name or clone_price is None:
+            return (
+                False,
+                last_pub_err or "у лота нет категории, способа получения или цены",
+                None,
+            )
 
-        attachments: list[bytes] = []
-        for att in getattr(src, "attachments", None) or []:
-            url = getattr(att, "url", None)
-            if not url:
-                continue
-            raw = self._download_attachment(url)
-            if raw:
-                attachments.append(raw)
+        try:
+            attachments: list[bytes] = []
+            for att in getattr(src, "attachments", None) or []:
+                url = getattr(att, "url", None)
+                if not url:
+                    continue
+                raw = self._download_attachment(url)
+                if raw:
+                    attachments.append(raw)
 
-        data_fields = self._item_data_fields(src)
-        draft = self.account.create_item(
-            game_category_id=cat_id,
-            obtaining_type_id=obt_id,
-            name=name,
-            price=int(price),
-            description=description,
-            options=attributes,
-            data_fields=data_fields,
-            attachments=attachments,
-        )
-        new_id = getattr(draft, "id", None)
-        if not new_id:
-            return (False, "create_item не вернул id", None)
+            data_fields = self._item_data_fields(src)
+            draft = self.account.create_item(
+                game_category_id=cat_id,
+                obtaining_type_id=obt_id,
+                name=name,
+                price=int(clone_price),
+                description=description,
+                options=attributes,
+                data_fields=data_fields,
+                attachments=attachments,
+            )
+            new_id = getattr(draft, "id", None)
+            if not new_id:
+                return (False, last_pub_err or "create_item не вернул id", None)
 
-        published = self._publish_free(new_id, int(price))
-        if published is None:
-            return (False, f"черновик {new_id} создан, но бесплатный приоритет не найден — выставь вручную", new_id)
-        pub_id = getattr(published, "id", None) or new_id
-        return (True, f"выставлен заново ({price}₽)", pub_id)
+            published = self._publish_free(new_id, int(clone_price), keep_in_sale=True)
+            pub_id = getattr(published, "id", None) or new_id
+            return (True, f"выставлен заново ({clone_price}₽)", pub_id)
+        except Exception as e:
+            clone_err = _api_err(e)
+            if last_pub_err:
+                return (False, f"{last_pub_err} | клон: {clone_err}", None)
+            return (False, clone_err, None)
 
     async def relist_item(self, item_id: str, item_name: str = "") -> tuple[bool, str, str | None]:
         """Асинхронная обёртка: клонирует лот и выставляет на витрину."""
@@ -416,7 +500,7 @@ class PlayerokMarket:
             )
         except Exception as e:
             log.exception("Playerok: не удалось перевыставить лот %s", item_id)
-            return (False, str(e), None)
+            return (False, _api_err(e), None)
 
     async def promote_item(self, item_id: str) -> tuple[bool, str]:
         """Поднимает лот в премиум (платно). Возвращает (успех, сообщение).

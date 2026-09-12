@@ -16,6 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -568,6 +569,102 @@ async def cmd_delacc(msg: Message, command: CommandObject):
         await msg.answer(f"✅ Аккаунт #{arg} удалён.")
 
 
+def _mafile_filename(acc: Account, mafile: MaFile) -> str:
+    name = mafile.account_name or acc.account_name or acc.login or f"acc{acc.id}"
+    safe = re.sub(r"[^\w.\-]+", "_", name, flags=re.UNICODE).strip("._")
+    return f"{safe or f'acc{acc.id}'}.maFile"
+
+
+async def _send_mafile(dest: Message, acc: Account) -> None:
+    mafile = MaFile.parse(acc.mafile)
+    doc = BufferedInputFile(
+        mafile.raw.encode("utf-8"),
+        filename=_mafile_filename(acc, mafile),
+    )
+    await dest.answer_document(
+        doc,
+        caption=(
+            f"📄 maFile #{acc.id} · <code>{html.escape(acc.login)}</code>\n"
+            f"Импорт: SDA / Steam Desktop Authenticator."
+        ),
+    )
+
+
+async def _send_guard_code(dest: Message, acc: Account) -> None:
+    mafile = MaFile.parse(acc.mafile)
+    await dest.answer(
+        f"🔑 Guard #{acc.id} · <code>{html.escape(acc.login)}</code>\n"
+        f"<code>{mafile.code()}</code>\n"
+        f"<i>ещё {mafile.seconds_left()} сек.</i>"
+    )
+
+
+@dp.message(Command("code", "codes", "guard"))
+async def cmd_code(msg: Message, command: CommandObject):
+    """Код Steam Guard: /code 12 или /codes — по всем аккаунтам."""
+    if not is_admin(msg.from_user.id):
+        return
+    arg = (command.args or "").strip().lstrip("#")
+    if arg.isdigit():
+        acc = await storage.account_by_id(int(arg))
+        if acc is None:
+            await msg.answer("Нет такого аккаунта.")
+            return
+        try:
+            await _send_guard_code(msg, acc)
+        except MaFileError as e:
+            await msg.answer(f"❌ maFile битый: {html.escape(str(e))}")
+        return
+    accs = await storage.all_accounts()
+    if not accs:
+        await msg.answer("Склад пуст. Или укажи id: <code>/code 12</code>")
+        return
+    lines = ["<b>Steam Guard</b>"]
+    for acc in accs:
+        try:
+            mafile = MaFile.parse(acc.mafile)
+            lines.append(
+                f"#{acc.id} <code>{html.escape(acc.login)}</code> — "
+                f"<code>{mafile.code()}</code> ({mafile.seconds_left()}с)"
+            )
+        except MaFileError:
+            lines.append(f"#{acc.id} <code>{html.escape(acc.login)}</code> — битый maFile")
+    # Telegram лимит 4096. Режем пачками.
+    chunk: list[str] = []
+    size = 0
+    for line in lines:
+        extra = len(line) + 1
+        if chunk and size + extra > 3500:
+            await msg.answer("\n".join(chunk))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += extra
+    if chunk:
+        await msg.answer("\n".join(chunk))
+
+
+@dp.message(Command("mafile", "mafiles"))
+async def cmd_mafile(msg: Message, command: CommandObject):
+    """Скачать maFile: /mafile 12"""
+    if not is_admin(msg.from_user.id):
+        return
+    arg = (command.args or "").strip().lstrip("#")
+    if not arg.isdigit():
+        await msg.answer(
+            "Скачать maFile аккаунта: <code>/mafile 12</code>\n"
+            "Код Guard: <code>/code 12</code> · все коды: <code>/codes</code>"
+        )
+        return
+    acc = await storage.account_by_id(int(arg))
+    if acc is None:
+        await msg.answer("Нет такого аккаунта.")
+        return
+    try:
+        await _send_mafile(msg, acc)
+    except MaFileError as e:
+        await msg.answer(f"❌ maFile битый: {html.escape(str(e))}")
+
+
 def _autorelist_status_text() -> str:
     state = "включено ✅" if cfg.auto_relist else "выключено ⛔️"
     return (
@@ -931,6 +1028,7 @@ async def start_with_token(msg: Message, command: CommandObject):
         return
     mafile = MaFile.parse(acc.mafile)
     await msg.answer(_tg_text(acc, deal, mafile), reply_markup=_code_kb(token))
+    await _send_mafile(msg, acc)
 
 
 STATUS_EMOJI = {"free": "🟢", "rented": "🔴", "sold": "⚫",
@@ -958,7 +1056,8 @@ def _panel_text() -> str:
         "Управляйте складом кнопками ниже.\n"
         "Команды тоже работают: /add, /rent, /link, /issue.\n\n"
         "<b>Товары:</b>\n"
-        "/add — Steam-аккаунт · /addtext — гайд · /addfile — файл · /addcodes — ключи\n"
+        "/add — Steam-аккаунт · /code 12 — Guard · /mafile 12 — скачать maFile\n"
+        "/addtext — гайд · /addfile — файл · /addcodes — ключи\n"
         "/digital — список цифровых товаров\n"
         "Кнопка «Авторелист» или /autorelist — заново выставлять лот после продажи"
     )
@@ -1043,8 +1142,12 @@ async def _render_account_card(cb: CallbackQuery, acc_id: int) -> None:
     if acc.note:
         lines.append(f"\n📝 <i>{html.escape(acc.note)}</i>")
 
-    kb = [[InlineKeyboardButton(text="🔑 Показать пароль",
-                                callback_data=f"acc:pw:{acc.id}")]]
+    kb = [[InlineKeyboardButton(text="🔑 Пароль",
+                                callback_data=f"acc:pw:{acc.id}"),
+           InlineKeyboardButton(text="🔄 Код Guard",
+                                callback_data=f"acc:code:{acc.id}")]]
+    kb.append([InlineKeyboardButton(text="📄 Скачать maFile",
+                                    callback_data=f"acc:mafile:{acc.id}")])
     kb.append([InlineKeyboardButton(text="📝 Заметка", callback_data=f"acc:note:{acc.id}")])
     if acc.status == "shared":
         kb.append([InlineKeyboardButton(text="↩️ Обычный режим",
@@ -1135,6 +1238,44 @@ async def cb_account_pw(cb: CallbackQuery):
         return
     # Пароль в отдельном всплывающем окне, чтобы не оставлять его в истории чата
     await cb.answer(f"{acc.login}\n{acc.password}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("acc:code:"))
+async def cb_account_code(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc = await storage.account_by_id(_cb_id(cb.data))
+    if acc is None:
+        await cb.answer("Не найден.", show_alert=True)
+        return
+    try:
+        mafile = MaFile.parse(acc.mafile)
+    except MaFileError as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    await cb.answer(f"{mafile.code()}  ({mafile.seconds_left()} сек.)", show_alert=True)
+    await cb.message.answer(
+        f"🔑 Guard #{acc.id} · <code>{html.escape(acc.login)}</code>\n"
+        f"<code>{mafile.code()}</code>\n"
+        f"<i>ещё {mafile.seconds_left()} сек.</i>"
+    )
+
+
+@dp.callback_query(F.data.startswith("acc:mafile:"))
+async def cb_account_mafile(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа.", show_alert=True)
+        return
+    acc = await storage.account_by_id(_cb_id(cb.data))
+    if acc is None:
+        await cb.answer("Не найден.", show_alert=True)
+        return
+    try:
+        await _send_mafile(cb.message, acc)
+        await cb.answer("maFile отправлен")
+    except MaFileError as e:
+        await cb.answer(str(e)[:180], show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("acc:note:"))
@@ -1252,6 +1393,7 @@ async def redeem_by_text(msg: Message):
     acc, deal = found
     mafile = MaFile.parse(acc.mafile)
     await msg.answer(_tg_text(acc, deal, mafile), reply_markup=_code_kb(deal.token))
+    await _send_mafile(msg, acc)
 
 
 @dp.callback_query(F.data.startswith("code:"))

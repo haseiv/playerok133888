@@ -15,6 +15,7 @@ accounts: у одного аккаунта их за жизнь будут де�
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -45,6 +46,14 @@ from config import cfg
 from crypto import decrypt, encrypt
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS delivered_orders (
+    order_id TEXT PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS file_tokens (
+    token TEXT PRIMARY KEY,
+    order_id TEXT UNIQUE NOT NULL,
+    payload_enc BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS accounts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     product      TEXT NOT NULL,
@@ -227,6 +236,16 @@ class Storage:
 
     async def _migrate(self) -> None:
         """CREATE TABLE IF NOT EXISTS не добавляет колонки в готовую таблицу."""
+        await self._db.execute(
+            "INSERT OR IGNORE INTO delivered_orders SELECT order_id FROM deals "
+            "WHERE order_id NOT IN (SELECT order_id FROM failed_deliveries)"
+        )
+        await self._db.execute(
+            "DELETE FROM deals WHERE active=0 AND order_id IN "
+            "(SELECT order_id FROM failed_deliveries) AND order_id NOT IN "
+            "(SELECT order_id FROM delivered_orders)"
+        )
+        await self._db.commit()
         cur = await self._db.execute("PRAGMA table_info(products)")
         cols = {r["name"] for r in await cur.fetchall()}
         if "slots" not in cols:
@@ -460,6 +479,39 @@ class Storage:
             "SELECT 1 FROM deals WHERE order_id=? LIMIT 1", (order_id,)
         )
         return await cur.fetchone() is not None
+
+    async def delivery_complete(self, order_id: str) -> bool:
+        cur = await self.db.execute("SELECT 1 FROM delivered_orders WHERE order_id=?", (order_id,))
+        return await cur.fetchone() is not None
+
+    async def mark_delivered(self, order_id: str) -> None:
+        await self.db.execute("INSERT OR IGNORE INTO delivered_orders VALUES (?)", (order_id,))
+        await self.db.execute("DELETE FROM failed_deliveries WHERE order_id=?", (order_id,))
+        await self.db.commit()
+
+    async def deal_by_order(self, order_id: str) -> tuple[Account, Deal] | None:
+        cur = await self.db.execute("SELECT * FROM deals WHERE order_id=? AND active=1", (order_id,))
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        deal = _deal(row)
+        acc = await self.account_by_id(deal.account_id)
+        return (acc, deal) if acc else None
+
+    async def file_token(self, order_id: str, data: dict) -> str:
+        token = secrets.token_urlsafe(18)
+        await self.db.execute(
+            "INSERT OR IGNORE INTO file_tokens VALUES (?,?,?)",
+            (token, order_id, encrypt(json.dumps(data))),
+        )
+        await self.db.commit()
+        cur = await self.db.execute("SELECT token FROM file_tokens WHERE order_id=?", (order_id,))
+        return (await cur.fetchone())["token"]
+
+    async def file_by_token(self, token: str) -> dict | None:
+        cur = await self.db.execute("SELECT payload_enc FROM file_tokens WHERE token=?", (token,))
+        row = await cur.fetchone()
+        return json.loads(decrypt(row["payload_enc"])) if row else None
 
     async def take_shared(self, product: str, order_id: str | None = None,
                           chat_id: str | None = None) -> tuple[Account, Deal] | None:
@@ -723,6 +775,14 @@ class Storage:
     async def take_code(self, product: str, order_id: str | None = None) -> str | None:
         """Выдаёт один неиспользованный код из пула. Атомарно."""
         async with self._take_lock:
+            if order_id is not None:
+                cur = await self.db.execute(
+                    "SELECT code_enc FROM codes WHERE product=? AND order_id=? AND used=1 ORDER BY id LIMIT 1",
+                    (product, order_id),
+                )
+                existing = await cur.fetchone()
+                if existing:
+                    return decrypt(existing["code_enc"])
             cur = await self.db.execute(
                 "UPDATE codes SET used=1, order_id=? "
                 "WHERE id=(SELECT id FROM codes WHERE product=? AND used=0 "

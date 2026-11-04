@@ -1003,7 +1003,7 @@ async def start_with_token(msg: Message, command: CommandObject):
 
     # Файловый токен цифрового товара: start=file_<token>
     if token.startswith("file_"):
-        data = _file_tokens.get(token[5:])
+        data = await storage.file_by_token(token[5:])
         if data is None:
             await msg.answer("❌ Ссылка недействительна или устарела.")
             return
@@ -1023,12 +1023,13 @@ async def start_with_token(msg: Message, command: CommandObject):
         await msg.answer("❌ Код выдачи не найден.")
         return
     acc, deal = found
-    if not deal.active:
+    if not deal.active or deal.expired():
         await msg.answer("❌ Эта выдача уже закрыта.")
         return
     mafile = MaFile.parse(acc.mafile)
     await msg.answer(_tg_text(acc, deal, mafile), reply_markup=_code_kb(token))
-    await _send_mafile(msg, acc)
+    if deal.kind == "sale":
+        await _send_mafile(msg, acc)
 
 
 STATUS_EMOJI = {"free": "🟢", "rented": "🔴", "sold": "⚫",
@@ -1391,9 +1392,13 @@ async def redeem_by_text(msg: Message):
         await msg.answer("❌ Такой код выдачи не найден.")
         return
     acc, deal = found
+    if not deal.active or deal.expired():
+        await msg.answer("❌ Эта выдача закрыта или срок аренды истёк.")
+        return
     mafile = MaFile.parse(acc.mafile)
     await msg.answer(_tg_text(acc, deal, mafile), reply_markup=_code_kb(deal.token))
-    await _send_mafile(msg, acc)
+    if deal.kind == "sale":
+        await _send_mafile(msg, acc)
 
 
 @dp.callback_query(F.data.startswith("code:"))
@@ -1404,7 +1409,7 @@ async def refresh_code(cb: CallbackQuery):
         await cb.answer("Нет доступа.", show_alert=True)
         return
     acc, deal = found
-    if deal.is_rent and (deal.expired() or not deal.active):
+    if not deal.active or deal.expired():
         await cb.answer("Срок аренды истёк — коды больше не выдаются.", show_alert=True)
         return
     mafile = MaFile.parse(acc.mafile)
@@ -1419,7 +1424,10 @@ async def notify_admins(text: str) -> None:
             log.exception("Не удалось уведомить админа %s", admin)
 
 
-CODE_WORDS = {"код", "кода", "коды", "code", "guard", "гуард", "гвард"}
+CODE_WORDS = {
+    "код", "кода", "коды", "коду", "кодом", "кодик", "кодика",
+    "code", "guard", "гуард", "гвард", "стимгард", "стимгуард",
+}
 
 # Код живёт 30 секунд. Без кулдауна покупатель, спамящий «код», выжрет
 # лимит запросов к площадке.
@@ -1442,11 +1450,8 @@ def _wants_code(text: str) -> bool:
     """Покупатель просит код?
 
     Ищем слово целиком, а не подстроку: иначе «кодировка» сработала бы как
-    запрос. Длинные сообщения игнорируем — там обычно вопрос, на который
-    нужен живой ответ, а не автомат.
+    запрос. Длина сообщения не влияет на распознавание запроса.
     """
-    if len(text) > 60:
-        return False
     words = set(re.findall(r"[a-zа-яё]+", text.lower()))
     return bool(words & CODE_WORDS)
 
@@ -1485,7 +1490,7 @@ def _access_text(acc: Account, deal: Deal, mafile: MaFile, shared: bool) -> str:
 # Токены для выдачи файлов через Telegram: token -> данные цифрового товара.
 # Файл нельзя отдать в чат Playerok (там только текст), поэтому покупатель
 # переходит по ссылке в Telegram-бота, а токен говорит боту, что отдать.
-_file_tokens: dict[str, dict] = {}
+_order_lock = asyncio.Lock()
 
 # Счётчик поднятий в премиум за сутки — предохранитель от лишних трат.
 _promote_counter = {"day": "", "count": 0}
@@ -1586,6 +1591,8 @@ async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str)
     # Автоподтверждение — только после успешной выдачи (ok=True),
     # чтобы не подтверждать деньги по несработавшим сделкам.
     confirm_line = ""
+    if ok:
+        await storage.mark_delivered(order.id)
     if ok and cfg.auto_confirm:
         confirmed = await market.confirm_deal(order.id, cfg.confirm_method)
         confirm_line = ("\n✅ Сделка подтверждена" if confirmed
@@ -1610,7 +1617,6 @@ async def _digital_admin_note(order: "Order", product: str, ok: bool, what: str)
 
 async def _deliver_digital(order: "Order", product: str, digital: dict) -> None:
     """Выдаёт цифровой товар: текст/коды в чат, файл — ссылкой в Telegram."""
-    import secrets as _secrets
     kind = digital["kind"]
     gift_note = ""
     if digital.get("gift_text"):
@@ -1619,7 +1625,8 @@ async def _deliver_digital(order: "Order", product: str, digital: dict) -> None:
     if kind == "text":
         ok = await market.send_message(order.chat_id,
             f"✅ Спасибо за покупку!\n\n{digital['text'] or ''}{gift_note}")
-        await storage.digital_sold_inc(product)
+        if ok:
+            await storage.digital_sold_inc(product)
         await _digital_admin_note(order, product, ok, "текст")
         return
 
@@ -1630,18 +1637,19 @@ async def _deliver_digital(order: "Order", product: str, digital: dict) -> None:
             return
         ok = await market.send_message(order.chat_id,
             f"✅ Спасибо за покупку!\n\nВаш код: {code}{gift_note}")
-        await storage.digital_sold_inc(product)
+        if ok:
+            await storage.digital_sold_inc(product)
         left = await storage.codes_left(product)
         await _digital_admin_note(order, product, ok, f"код (осталось {left})")
         return
 
     if kind == "file":
-        token = _secrets.token_urlsafe(9)
-        _file_tokens[token] = digital
+        token = await storage.file_token(order.id, digital)
         link = f"https://t.me/{cfg.bot_username}?start=file_{token}"
         ok = await market.send_message(order.chat_id,
             f"✅ Спасибо за покупку!\n\nЗаберите файл здесь: {link}{gift_note}")
-        await storage.digital_sold_inc(product)
+        if ok:
+            await storage.digital_sold_inc(product)
         await _digital_admin_note(order, product, ok, "файл (ссылка)")
         return
 
@@ -1669,9 +1677,15 @@ def _shared_text(acc: Account, mafile: MaFile) -> str:
 
 
 async def handle_order(order: Order) -> None:
+    # События слушателя и очередь могут обрабатывать один заказ одновременно.
+    async with _order_lock:
+        await _handle_order(order)
+
+
+async def _handle_order(order: Order) -> None:
     # Площадка может прислать событие повторно (переподключение, ретрай).
     # Второй раз выдавать аккаунт нельзя.
-    if await storage.deal_exists(order.id):
+    if await storage.delivery_complete(order.id):
         log.info("Заказ %s уже обработан, пропускаю", order.id)
         return
 
@@ -1696,6 +1710,11 @@ async def handle_order(order: Order) -> None:
         await _after_sale(order, product, delivered=False, is_rent=is_rent)
         return
 
+    # Сохраняем заказ до резервирования товара и первого сетевого запроса.
+    await storage.queue_failed_delivery(
+        order.id, order.item_id, order.item_name, order.chat_id, order.buyer,
+    )
+
     # Цифровой товар (текст / файл / коды) — проверяем до Steam-аккаунтов.
     digital = await storage.get_digital(product)
     if digital is not None:
@@ -1703,7 +1722,16 @@ async def handle_order(order: Order) -> None:
         return
 
     # Общий аккаунт: выдаётся бесконечно, не занимается и не списывается.
-    shared = await storage.take_shared(product, order_id=order.id, chat_id=order.chat_id)
+    pending = await storage.deal_by_order(order.id)
+    if pending and (not pending[1].active or pending[1].expired()):
+        await notify_admins(
+            f"⚠️ Заказ {html.escape(order.id)}: резерв закрыт или срок аренды истёк. "
+            "Проверьте выдачу вручную."
+        )
+        return
+    shared = pending if pending and pending[1].kind == "shared" else None
+    if pending is None:
+        shared = await storage.take_shared(product, order_id=order.id, chat_id=order.chat_id)
     if shared is not None:
         acc, deal = shared
         mafile = MaFile.parse(acc.mafile)
@@ -1711,7 +1739,7 @@ async def handle_order(order: Order) -> None:
         await _digital_admin_note(order, product, ok, f"общий аккаунт #{acc.id}")
         return
 
-    taken = await storage.take_account(product, order_id=order.id, chat_id=order.chat_id)
+    taken = pending or await storage.take_account(product, order_id=order.id, chat_id=order.chat_id)
     if taken is None:
         await notify_admins(
             f"⚠️ Заказ {order.id}: нет свободных аккаунтов "
@@ -1727,9 +1755,7 @@ async def handle_order(order: Order) -> None:
     )
 
     if not ok:
-        # Отправка не удалась — аккаунт занимать нельзя, иначе он повиснет
-        # арендованным без арендатора. Откатываем.
-        await storage.finish_deal(deal.order_id, "free")
+        # Резерв сохраняется: повторная попытка отправит тот же аккаунт.
         # Ставим в очередь повторной выдачи — фоновый цикл попробует снова.
         await storage.queue_failed_delivery(
             order.id, order.item_id, order.item_name,
@@ -1737,12 +1763,13 @@ async def handle_order(order: Order) -> None:
         )
         await notify_admins(
             f"❌ Заказ {order.id}: не удалось отправить данные в чат.\n"
-            f"Аккаунт #{acc.id} возвращён на склад.\n"
+            f"Аккаунт #{acc.id} зарезервирован до повторной выдачи.\n"
             f"🔄 Заказ поставлен в очередь повторной выдачи."
         )
         await _after_sale(order, product, delivered=False, is_rent=deal.is_rent)
         return
 
+    await storage.mark_delivered(order.id)
     kind = f"🕒 аренда {human_left(deal.seconds_left())}" if deal.is_rent else "💰 продажа"
     busy = await storage.active_slots(acc.id)
     slot_info = f" | слоты: {busy}/{slots}" if slots > 1 else ""
@@ -1775,14 +1802,18 @@ async def handle_chat_message(msg: IncomingMessage) -> None:
     if not _wants_code(msg.text):
         return
 
+    log.info("Запрос Guard в чате %s", msg.chat_id)
+
     found = await storage.active_deal_by_chat(msg.chat_id)
     if found is None:
+        log.warning("Guard: в чате %s нет активной сделки", msg.chat_id)
         return  # чат без активной сделки — не наше дело
 
     acc, deal = found
 
     now = time.monotonic()
     if now - _last_reply.get(msg.chat_id, 0) < REPLY_COOLDOWN:
+        log.info("Guard: кулдаун в чате %s", msg.chat_id)
         return
     _last_reply[msg.chat_id] = now
 
@@ -1803,8 +1834,11 @@ async def handle_chat_message(msg: IncomingMessage) -> None:
     )
     if deal.is_rent:
         text += f"\n🕒 Аренда: осталось {human_left(deal.seconds_left())}."
-    await market.send_message(msg.chat_id, text)
-    await storage.log(acc.id, "code_requested", msg.chat_id)
+    if await market.send_message(msg.chat_id, text):
+        await storage.log(acc.id, "code_requested", msg.chat_id)
+        log.info("Guard отправлен в чат %s", msg.chat_id)
+    else:
+        log.warning("Guard: отправка в чат %s не удалась", msg.chat_id)
 
 
 # ─────────────────────────── окончание аренд ───────────────────────────
@@ -1862,7 +1896,7 @@ async def retry_failed_deliveries_loop() -> None:
                 order_id = entry["order_id"]
 
                 # Если заказ уже выдан (например, вручную) — убираем.
-                if await storage.deal_exists(order_id):
+                if await storage.delivery_complete(order_id):
                     await storage.drop_failed_delivery(order_id)
                     continue
 
@@ -1895,7 +1929,7 @@ async def retry_failed_deliveries_loop() -> None:
                     # queue_failed_delivery вставит INSERT OR IGNORE (уже есть).
                     # Проверяем: если после handle_order сделка появилась —
                     # значит выдача прошла.
-                    if await storage.deal_exists(order_id):
+                    if await storage.delivery_complete(order_id):
                         await storage.drop_failed_delivery(order_id)
                         log.info("Повторная выдача заказа %s: успешно", order_id)
                     else:

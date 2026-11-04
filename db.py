@@ -282,12 +282,12 @@ class Storage:
         """[(товар, статус аккаунта, количество)]"""
         cur = await self.db.execute(
             "SELECT product, status, COUNT(*) c FROM accounts "
-            "GROUP BY product, status ORDER BY product, status"
+            "WHERE status!='archived' GROUP BY product, status ORDER BY product, status"
         )
         return [(r["product"], r["status"], r["c"]) for r in await cur.fetchall()]
 
     async def account_by_id(self, account_id: int) -> Account | None:
-        cur = await self.db.execute("SELECT * FROM accounts WHERE id=?", (account_id,))
+        cur = await self.db.execute("SELECT * FROM accounts WHERE id=? AND status!='archived'", (account_id,))
         row = await cur.fetchone()
         return _account(row) if row else None
 
@@ -295,57 +295,59 @@ class Storage:
         """Все аккаунты, опционально по товару. Для списка в панели."""
         if product:
             cur = await self.db.execute(
-                "SELECT * FROM accounts WHERE product=? ORDER BY id", (product,)
+                "SELECT * FROM accounts WHERE product=? AND status!='archived' ORDER BY id", (product,)
             )
         else:
-            cur = await self.db.execute("SELECT * FROM accounts ORDER BY product, id")
+            cur = await self.db.execute("SELECT * FROM accounts WHERE status!='archived' ORDER BY product, id")
         return [_account(r) for r in await cur.fetchall()]
 
     async def count_accounts(self) -> int:
-        cur = await self.db.execute("SELECT COUNT(*) c FROM accounts")
+        cur = await self.db.execute("SELECT COUNT(*) c FROM accounts WHERE status!='archived'")
         return (await cur.fetchone())["c"]
 
     async def delete_account(self, account_id: int) -> str:
-        """Удаляет один аккаунт. Возвращает: ok | not_found | busy.
-
-        Аккаунт в активной аренде удалять нельзя — арендатор потеряет доступ
-        посреди оплаченного срока.
-        """
-        acc = await self.account_by_id(account_id)
-        if acc is None:
-            return "not_found"
-        if acc.status == "rented":
-            return "busy"
-        await self.db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-        await self.db.commit()
-        await self.log(account_id, "account_deleted", acc.product)
-        return "ok"
+        """Архивирует аккаунт, сохраняя историю и закрывая прежние токены."""
+        async with self._take_lock:
+            acc = await self.account_by_id(account_id)
+            if acc is None:
+                return "not_found"
+            cur = await self.db.execute(
+                "SELECT 1 FROM deals WHERE account_id=? AND active=1 AND kind='rent' LIMIT 1",
+                (account_id,),
+            )
+            if await cur.fetchone():
+                return "busy"
+            await self.db.execute("UPDATE deals SET active=0 WHERE account_id=?", (account_id,))
+            await self.db.execute("UPDATE accounts SET status='archived' WHERE id=?", (account_id,))
+            await self.db.commit()
+            await self.log(account_id, "account_deleted", acc.product)
+            return "ok"
 
     async def delete_product(self, product: str) -> tuple[str, int]:
-        """Удаляет товар целиком: его настройки, связки лотов и все свободные
-        аккаунты. Возвращает (статус, сколько_аккаунтов_удалено).
-
-        Статус: ok | not_found | busy. busy — если есть аккаунты в аренде:
-        тогда не трогаем ничего, чтобы не оборвать активные сделки.
-        """
-        accs = await self.all_accounts(product)
-        settings = await self.product_settings_exists(product)
-        if not accs and not settings:
-            return ("not_found", 0)
-
-        if any(a.status == "rented" for a in accs):
-            return ("busy", 0)
-
-        # Удаляем только свободные/проданные/на проверке — активных аренд нет
-        cur = await self.db.execute(
-            "DELETE FROM accounts WHERE product=?", (product,)
-        )
-        deleted = cur.rowcount
-        await self.db.execute("DELETE FROM products WHERE product=?", (product,))
-        await self.db.execute("DELETE FROM lot_map WHERE product=?", (product,))
-        await self.db.commit()
-        await self.log(None, "product_deleted", f"{product}:{deleted}")
-        return ("ok", deleted)
+        """Архивирует аккаунты товара, не удаляя историю сделок."""
+        async with self._take_lock:
+            accs = await self.all_accounts(product)
+            if not accs and not await self.product_settings_exists(product):
+                return ("not_found", 0)
+            cur = await self.db.execute(
+                "SELECT 1 FROM deals d JOIN accounts a ON a.id=d.account_id "
+                "WHERE a.product=? AND d.active=1 AND d.kind='rent' LIMIT 1", (product,),
+            )
+            if await cur.fetchone():
+                return ("busy", 0)
+            await self.db.execute(
+                "UPDATE deals SET active=0 WHERE account_id IN (SELECT id FROM accounts WHERE product=?)",
+                (product,),
+            )
+            cur = await self.db.execute(
+                "UPDATE accounts SET status='archived' WHERE product=? AND status!='archived'", (product,),
+            )
+            deleted = cur.rowcount
+            await self.db.execute("DELETE FROM products WHERE product=?", (product,))
+            await self.db.execute("DELETE FROM lot_map WHERE product=?", (product,))
+            await self.db.commit()
+            await self.log(None, "product_deleted", f"{product}:{deleted}")
+            return ("ok", deleted)
 
     async def product_settings_exists(self, product: str) -> bool:
         cur = await self.db.execute(
@@ -355,7 +357,7 @@ class Storage:
 
     async def set_status(self, account_id: int, status: str) -> bool:
         cur = await self.db.execute(
-            "UPDATE accounts SET status=? WHERE id=?", (status, account_id)
+            "UPDATE accounts SET status=? WHERE id=? AND status!='archived'", (status, account_id)
         )
         await self.db.commit()
         return cur.rowcount > 0
@@ -461,7 +463,7 @@ class Storage:
             return None
         # Собираем названия и из аккаунтов, и из цифровых товаров.
         names: set[str] = set()
-        cur = await self.db.execute("SELECT DISTINCT product FROM accounts")
+        cur = await self.db.execute("SELECT DISTINCT product FROM accounts WHERE status!='archived'")
         for r in await cur.fetchall():
             names.add(r["product"])
         cur = await self.db.execute("SELECT product FROM digital_products")
@@ -666,7 +668,7 @@ class Storage:
             # нельзя — просто освобождаем слот.
             status = "free" if remaining > 0 else return_status
             await self.db.execute(
-                "UPDATE accounts SET status=? WHERE id=?", (status, account_id)
+                "UPDATE accounts SET status=? WHERE id=? AND status!='archived'", (status, account_id)
             )
             await self.db.commit()
             await self.log(account_id, "deal_finished", order_id)

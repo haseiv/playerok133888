@@ -104,3 +104,28 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.store.delivery_complete('legacy-success'))
         self.assertFalse(await self.store.delivery_complete('legacy-failure'))
         self.assertFalse(await self.store.deal_exists('legacy-failure'))
+
+    async def test_archive_preserves_history_and_hides_account(self):
+        account_id = await self.store.add_account('product', 'login', 'pw', '{}')
+        _, deal = await self.store.take_account('product', order_id='old-sale')
+        self.assertEqual(await self.store.delete_account(account_id), 'ok')
+        self.assertTrue(await self.store.deal_exists('old-sale'))
+        self.assertIsNone(await self.store.deal_by_token(deal.token))
+        self.assertIsNone(await self.store.account_by_id(account_id))
+        self.assertEqual(await self.store.all_accounts(), [])
+        self.assertEqual(await self.store.stock(), [])
+        self.assertEqual(await self.store.count_accounts(), 0)
+        self.assertIsNone(await self.store.take_account('product'))
+
+    async def test_cannot_archive_partially_occupied_rental(self):
+        account_id = await self.store.add_account('product', 'login', 'pw', '{}')
+        await self.store.db.execute("INSERT INTO products VALUES ('product',1,2)")
+        await self.store.db.commit()
+        await self.store.take_account('product', order_id='rent')
+        self.assertEqual((await self.store.account_by_id(account_id)).status, 'free')
+        self.assertEqual(await self.store.delete_account(account_id), 'busy')
+        self.assertEqual(await self.store.delete_product('product'), ('busy', 0))
+        await self.store.finish_deal('rent', 'free')
+        self.assertEqual(await self.store.delete_product('product'), ('ok', 1))
+        self.assertTrue(await self.store.deal_exists('rent'))
+        self.assertEqual(await self.store.all_accounts(), [])

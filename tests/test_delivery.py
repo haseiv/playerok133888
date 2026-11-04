@@ -70,6 +70,18 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.store.delivery_complete('order'))
         self.assertEqual((await self.store.account_by_id(account_id)).rents_count, 1)
 
+    async def test_closed_pending_reservation_does_not_allocate_another_account(self):
+        await self.store.add_account('product', 'login', 'pw', '{"shared_secret":"dGVzdA=="}')
+        await self.store.add_account('product', 'login2', 'pw', '{"shared_secret":"dGVzdA=="}')
+        self.market.send_message.return_value = False
+        await bot.handle_order(self.order)
+        await self.store.finish_deal('order', 'free')
+        self.market.send_message.return_value = True
+        await bot.handle_order(self.order)
+        self.assertEqual(self.market.send_message.await_count, 1)
+        self.assertFalse(await self.store.delivery_complete('order'))
+        self.assertEqual((await self.store.account_by_id(2)).status, 'free')
+
     async def test_code_retry_and_concurrent_duplicate(self):
         await self.store.make_codes_product('product')
         await self.store.add_codes('product', ['KEY1', 'KEY2'])

@@ -1723,6 +1723,12 @@ async def _handle_order(order: Order) -> None:
 
     # Общий аккаунт: выдаётся бесконечно, не занимается и не списывается.
     pending = await storage.deal_by_order(order.id)
+    if pending and (not pending[1].active or pending[1].expired()):
+        await notify_admins(
+            f"⚠️ Заказ {html.escape(order.id)}: резерв закрыт или срок аренды истёк. "
+            "Проверьте выдачу вручную."
+        )
+        return
     shared = pending if pending and pending[1].kind == "shared" else None
     if pending is None:
         shared = await storage.take_shared(product, order_id=order.id, chat_id=order.chat_id)

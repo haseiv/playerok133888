@@ -492,7 +492,7 @@ class Storage:
         await self.db.commit()
 
     async def deal_by_order(self, order_id: str) -> tuple[Account, Deal] | None:
-        cur = await self.db.execute("SELECT * FROM deals WHERE order_id=? AND active=1", (order_id,))
+        cur = await self.db.execute("SELECT * FROM deals WHERE order_id=?", (order_id,))
         row = await cur.fetchone()
         if row is None:
             return None

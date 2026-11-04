@@ -1023,12 +1023,13 @@ async def start_with_token(msg: Message, command: CommandObject):
         await msg.answer("❌ Код выдачи не найден.")
         return
     acc, deal = found
-    if not deal.active:
+    if not deal.active or deal.expired():
         await msg.answer("❌ Эта выдача уже закрыта.")
         return
     mafile = MaFile.parse(acc.mafile)
     await msg.answer(_tg_text(acc, deal, mafile), reply_markup=_code_kb(token))
-    await _send_mafile(msg, acc)
+    if deal.kind == "sale":
+        await _send_mafile(msg, acc)
 
 
 STATUS_EMOJI = {"free": "🟢", "rented": "🔴", "sold": "⚫",
@@ -1391,9 +1392,13 @@ async def redeem_by_text(msg: Message):
         await msg.answer("❌ Такой код выдачи не найден.")
         return
     acc, deal = found
+    if not deal.active or deal.expired():
+        await msg.answer("❌ Эта выдача закрыта или срок аренды истёк.")
+        return
     mafile = MaFile.parse(acc.mafile)
     await msg.answer(_tg_text(acc, deal, mafile), reply_markup=_code_kb(deal.token))
-    await _send_mafile(msg, acc)
+    if deal.kind == "sale":
+        await _send_mafile(msg, acc)
 
 
 @dp.callback_query(F.data.startswith("code:"))
@@ -1404,7 +1409,7 @@ async def refresh_code(cb: CallbackQuery):
         await cb.answer("Нет доступа.", show_alert=True)
         return
     acc, deal = found
-    if deal.is_rent and (deal.expired() or not deal.active):
+    if not deal.active or deal.expired():
         await cb.answer("Срок аренды истёк — коды больше не выдаются.", show_alert=True)
         return
     mafile = MaFile.parse(acc.mafile)
